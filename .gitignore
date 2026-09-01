@@ -1,0 +1,8 @@
+**/node_modules/
+**/dist/
+**/.ruff_cache/
+**/.cache/
+**/coverage/
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,14 @@
+{
+  "name": "@adminsmart/dsh-knowledge-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "check": "node --check src/index.mjs && node tests/plugin-contract.test.mjs"
+  }
+}
