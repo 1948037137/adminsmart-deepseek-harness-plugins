@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "runtimeProfileName": "adminsmart-web",
+  "agentModes": {
+    "knowledge": {
+      "agentPresetId": "adminsmart-knowledge"
+    }
+  }
+}

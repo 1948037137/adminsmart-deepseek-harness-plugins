@@ -1,0 +1,398 @@
+# AdminSmart 固定 Harness 0.2.1-alpha.1 Web Runtime Profile。
+# 本文件只组装跨业务共享能力；知识库等业务提示词和工具归 Agent Preset 插件所有。
+
+# 管理员私有官方 Provider Profile 初始为空；开发与生产均由同一受管插件页面编辑。
+# 普通 Runtime 只加载受签名目录的共享模型；两者不复用可编辑配置或供应商凭据。
+
+# Runtime 只声明可信宿主边界，具体产品身份和任务由当前 Agent Preset 注册。
+- id: system-prompt
+  config:
+    personaPrefix: >-
+      你是 AdminSmart 受管智能体。当前 Session 的身份、业务工作目录、文件范围和工具边界由服务端允许的 Agent Preset 决定。只能使用实际注册的官方工具和受管业务工具；允许在知识业务工作目录使用官方文件与办公命令处理已授权文件，但不得扫描其他目录、读取凭据、操作其他用户数据或绕过业务规则。当前 Windows 写入沙箱不是完整读取隔离，不得把提示词约束说成操作系统安全隔离。
+
+# 模型工具调用统一走 Harness Native Tool 协议。
+- id: tools
+  config:
+    mode: native
+
+# 官方调度器最多并行两个 Tool；知识 Preset 的单次委派复用原生 Agent Loop。
+- id: agent-loop
+  config:
+    maxParallelToolCalls: 2
+
+- id: subagent
+  config:
+    maxDepth: 1
+    maxActiveSubagents: 2
+
+# 会话搜索按需建立临时全文索引，不把本机目录当作业务边界。
+- id: session-query-sqlite
+  config:
+    path: ':memory:'
+    openAt: first-search
+
+# 管理员使用官方可编辑的纯对象；普通用户没有此插件和私有凭据读取能力。
+- id: llm-pi-ai
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+  config:
+    providers: {}
+
+# 独立官方适配器实例只向普通用户注册后端白名单，不能由管理员 Models 编辑器写入。
+- insert:
+    - id: adminsmart-managed-llm
+      name: '@deepseek-ai/dsh-llm-pi-ai'
+      disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN === '1'"
+      config:
+        providers: !!js JSON.parse(process.env.ADMINSMART_AGENT_PROVIDERS_JSON || '{}')
+
+- id: agent-default-model
+  config:
+    provider: !!js process.env.ADMINSMART_AGENT_DEFAULT_PROVIDER
+    model: !!js process.env.ADMINSMART_AGENT_DEFAULT_MODEL
+
+# 原生上传、持久附件、发送回执和草稿清理由官方 LocalAttachmentStore 负责；历史自有附件读取插件已退役。
+- id: attachment-local
+  name: '@deepseek-ai/dsh-attachment-local'
+  disabled: false
+  config:
+    maxImageBytes: 10485760
+    maxImagesPerMessage: 4
+    maxMessageImageBytes: 20971520
+    imageCompressionConcurrency: 1
+
+# 使用官方上传调度限制单客户端并行文件数，避免大文件竞争页面与网络资源。
+- id: ui-conversation
+  config:
+    maxConcurrentFileUploads: 2
+
+# 官方语音插件拥有麦克风、识别 API 和 SenseVoice Worker；模型文件共享只读，运行状态仍按 DSH_HOME 隔离。
+- id: speech-to-text-sensevoice
+  config:
+    dataRoot: !!js dshHomePath('speech-to-text', 'sensevoice')
+    modelDirectory: !!js process.env.ADMINSMART_SENSEVOICE_MODEL_DIRECTORY
+    vadModelPath: !!js process.env.ADMINSMART_SENSEVOICE_VAD_MODEL_PATH
+    vadThreshold: 0.25
+    minSpeechSeconds: 0.1
+    minSilenceSeconds: 0.4
+
+# 官方声明式 Agent Preset 延续历史 0.1.7 阶段的组合方式；当前 Gateway 通过环境变量选择唯一的业务 preset，客户端不显示切换入口。
+- id: agent-preset-registry
+  config:
+    default: !!js process.env.ADMINSMART_AGENT_PRESET_ID
+    modeSelectionEnabled: false
+
+# Web 基础 Bundle 带来的四个编程预设不属于业务白名单；历史 Session 文件保留，不能再绑定这些预设执行。
+- id: preset-standard
+  disabled: true
+
+- id: preset-ptc
+  disabled: true
+
+- id: preset-minimal
+  disabled: true
+
+- id: preset-cordis
+  disabled: true
+
+# 当前知识业务 Preset 直接走官方 registry 声明，不再依赖旧版目录扫描或 preset 路径。
+- insert:
+    - id: preset-adminsmart-knowledge
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: adminsmart-knowledge
+        name: AuraSearch 知识库
+        description: AdminSmart 知识库问答业务能力
+        plugins:
+          - id: adminsmart-knowledge-agent
+            name: '__ADMINSMART_KNOWLEDGE_AGENT_PLUGIN_URI__'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+            config:
+              enableRunInBackground: false
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+            config:
+              enableRunInBackground: false
+          - id: skill-office
+            name: '@deepseek-ai/dsh-skill-office'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              search: true
+              fetch: true
+              fetchTimeoutMs: 30000
+              fetchMaxOutputChars: 30000
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 32768
+                  headChars: 16384
+                  tailChars: 4096
+
+# Web Client 不注入服务器 cwd 或 Coding Agent 表层上下文。
+- id: web-runtime
+  config:
+    openBrowser: !!js ctx.webStartup.openBrowser
+    printUrl: true
+    surfaceContext: false
+    trustedHosts: !!js ctx.webStartup.trustedHosts
+
+# 模型可见联网能力统一使用 Harness 官方 `web_search`/`web_fetch` 工具。
+# 搜索由知识 Agent 的匿名 AnySearch Provider 执行；旧 Provider ID 保留以兼容
+# 共享 Gateway 的 Profile 校验。聊天模型 Key 不参与搜索，也不进入浏览器。
+- id: web
+  config:
+    searchProvider: adminsmart-openai-responses
+    fetchProvider: adminsmart-public-doh
+
+# Web Tool 只在知识 Agent Preset 挂载；根层保留官方禁用状态，避免重复注册和未来业务模式继承联网能力。
+- id: tool-web
+  disabled: true
+
+# 当前共享 Runtime 禁止加载知识问答不需要的高风险能力；新版 Harness 已移除旧 code-runtime 条目，因此不再覆盖不存在的行。
+- id: fs-sandbox
+  disabled: false
+  config:
+    cwd: !!js process.cwd()
+
+# 写入范围使用真实业务 cwd；显式配置避免继承主机的宽权限环境值。
+- id: sandbox-policy
+  config:
+    mode: workspace-write
+    workspaceRoot: !!js process.cwd()
+
+# 不从业务文件、上传附件或主机用户目录加载额外 AGENTS/技能指令。
+- id: agent-instructions
+  disabled: true
+
+- id: skill-filesystem
+  disabled: true
+
+# PTC 与 Workflow 代码执行链依赖 ctx.fs；知识 Agent 明确不挂载代码执行、
+# 任意文件系统或 Workflow Tool，因此必须在 Profile 层整体关闭，避免只关 UI
+# 后仍让后台服务等待缺失的 fs 能力并产生 pending/ERR_MODULE_NOT_FOUND。
+- id: ptc-runtime
+  disabled: true
+
+- id: workflow-ptc
+  disabled: true
+
+- id: tool-workflow
+  disabled: true
+
+# 没有代码内置模型保底；只有管理员自己添加的供应商或普通用户被勾选的模型可用。
+- id: llm-deepseek
+  disabled: true
+
+- id: session-log-download
+  disabled: true
+
+- id: web-search-deepseek
+  name: '@deepseek-ai/dsh-web-search-deepseek'
+  disabled: true
+  config:
+    # 官方插件默认读取 DEEPSEEK_API_KEY；具体端点和凭据引用可在官方网页搜索设置页维护。
+    apiKeyEnv: DEEPSEEK_API_KEY
+
+- id: file-reference-local
+  disabled: true
+
+- id: directory-picker
+  disabled: true
+
+# 仅开放官方限时办公命令，不开放交互终端、后台常驻或权限升级入口。
+- id: terminal-controller
+  disabled: true
+
+- id: ui-sidebar-terminal
+  disabled: true
+
+- id: shell-env
+  disabled: false
+
+- id: bash-sandbox
+  disabled: !!js process.platform === 'win32'
+  config:
+    timeoutMs: 60000
+    maxTimeoutMs: 120000
+    maxOutputBytes: 32768
+    maxSpillBytes: 2097152
+    graceMs: 3000
+
+- id: pwsh-sandbox
+  disabled: !!js process.platform !== 'win32'
+  config:
+    timeoutMs: 60000
+    maxTimeoutMs: 120000
+    maxOutputBytes: 32768
+    maxSpillBytes: 2097152
+    graceMs: 3000
+
+- id: tool-bash
+  disabled: true
+
+- id: tool-pwsh
+  disabled: true
+
+# 官方 Settings、插件清单和插件管理 Host/API 只对可信管理员 Runtime 挂载；
+# 非管理员即使绕过页面也不会拥有对应 Remote 服务。
+- id: settings-controller
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+
+- id: plugin-manager
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+
+- id: plugin-inventory
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+
+# 多用户网站不得让浏览器在服务器上启动本机程序或浏览 Workspace 目录。
+- id: open-in-app
+  disabled: true
+
+- id: ui-open-in-app
+  disabled: true
+
+- id: workspace-files
+  disabled: false
+
+- id: ui-sidebar-files
+  disabled: true
+
+# 官方文档预览 Client 负责 Harness 原生文件、PDF 和 Office 预览；知识库业务仍保留受管附件读取边界。
+- id: ui-sidebar-documentpreview
+  disabled: false
+
+# 网页搜索结果仍由官方 web_search/web_fetch 处理；侧栏 Browser 只会在拒绝 iframe 的站点上留下空白页，知识业务不需要它。
+- id: ui-sidebar-browser
+  disabled: true
+
+- id: ui-settings
+  disabled: true
+
+# 官方表单与界面继续呈现通用设置；受限提供方只补环境级持久化，所有角色共用同一装配。
+# ui-settings-general 同时拥有设置入口与 settings.open 快捷键，仅在签名管理员 Runtime 注册。
+
+# 官方快捷键引擎继续处理按键；参考页和 Mod+/ 编辑入口仅属于签名管理员。
+- id: ui-shortcuts
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+
+- id: ui-settings-general
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+
+- id: ui-settings-models
+  disabled: true
+
+# 历史 RC2 引入的官方子代理模型选择管理在当前固定版继续属于管理员面，普通用户只继承父模型。
+- id: ui-settings-subagent
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+
+- id: ui-settings-plugin-inventory
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+
+- id: ui-plugin-manager
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+
+# 官方品牌由 AdminSmart Client UI 插件通过公开 Slot 替换。
+- id: ui-brand-official
+  disabled: true
+
+- id: ui-cordis
+  disabled: true
+
+- id: ui-workflow-run
+  disabled: true
+
+- id: ui-deliverables
+  disabled: false
+
+- id: ui-skill
+  disabled: false
+
+- id: ui-subagent
+  disabled: false
+
+- id: ui-reference
+  disabled: true
+
+- id: ui-jobs
+  disabled: true
+
+# 新版 Web 默认提供后台定时任务；当前知识模式没有批准此权限，独立官方测试仍使用原生默认组合。
+- id: schedule
+  disabled: true
+
+- id: ui-schedule
+  disabled: true
+
+- id: ui-goal
+  disabled: true
+
+- id: ui-permission
+  disabled: true
+
+- id: ui-agent-preset
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+
+- id: ui-settings-plugins
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+
+- id: ui-plan
+  disabled: true
+
+- id: ui-user-questions
+  disabled: true
+
+- id: ui-trajectory
+  disabled: false
+
+# AdminSmart Host 提供品牌资产、Session 联网控制、受管模型和用户界面状态桥接；会话搜索由官方 Workspace/SessionQuery 提供。
+- insert:
+    - id: adminsmart-runtime-host
+      name: '__ADMINSMART_HARNESS_HOST_PLUGIN_URI__'
+    # 原生模块仅作为只读 Client 资源由提供方调用；唯一 owned entry 避免重复 ConfigForms。
+    - id: adminsmart-shared-settings
+      name: '__ADMINSMART_SHARED_SETTINGS_PLUGIN_URI__'
+    # 仅通过官方快捷键公开配置接口采用后端策略，不接管键盘引擎或固定输入动作。
+    - id: adminsmart-shared-shortcuts
+      name: '__ADMINSMART_SHARED_SHORTCUTS_PLUGIN_URI__'
+    # 官方请求时钟按每轮准备时采样；不能把历史对话中的“今天”当作当前日期。
+    - id: time-context
+      name: '@deepseek-ai/dsh-time-context'
+      config:
+        timeZone: Asia/Shanghai
+        refreshIntervalMs: 0
+
+# 用户知识问答永久关闭 Harness 遥测上传。
+- id: session-telemetry-otel
+  disabled: true
+
+# 官方模型 Session Log 是独立上传通道，必须与 OTel 一起保持知识会话禁止外传。
+- id: session-log-deepseek
+  disabled: true
+  config:
+    enabled: false
+
+# 固定隐私边界不作为可切换的个人/管理员偏好，所有角色均不显示上传开关。
+- id: ui-settings-session-log
+  disabled: true
+
+# 历史 0.1.7-rc.2 基础 Bundle 已带入 MCP Resources 注册项，当前固定版仍保留；AdminSmart 不挂载任何外部 MCP，必须显式关闭。
+- id: mcp-resources
+  disabled: true

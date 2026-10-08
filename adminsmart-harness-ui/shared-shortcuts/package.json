@@ -1,0 +1,10 @@
+{
+  "name": "@adminsmart/dsh-client-shared-shortcuts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": { ".": "./src/index.mjs", "./client": "./lib/client.js", "./package.json": "./package.json" },
+  "dsh": { "client": { "inject": ["@deepseek-ai/dsh-client-shortcuts"], "platform": "web" } },
+  "scripts": { "check": "node --check src/index.mjs && node --check src/shared-shortcuts-client.mjs && node --check src/shortcut-policy-http.mjs && node --check lib/client.js && node --test tests/shared-shortcuts.test.mjs" }
+}

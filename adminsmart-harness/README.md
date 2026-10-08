@@ -1,23 +1,33 @@
-# AdminSmart DeepSeek Harness 插件
+# AdminSmart Harness 知识集成
 
-本项目是 AdminSmart 自有的 DeepSeek Harness 扩展，不修改 Harness 上游源码。
+本目录只维护 AdminSmart 的业务权限与证据集成，不修改 Harness 上游源码。共享固定版为 0.2.1-alpha.1。
 
-## 能力
+## 保留的职责
 
-- 在 Agent 作用域隐藏所有全局工具。
-- 只暴露 `search_knowledge` LightRAG 知识检索工具。
-- 注入中文知识库系统提示词和提示词注入防护。
-- 使用本机能力凭证调用 FastAPI 内部知识工具 API。
+- index.mjs：同一 Agent Preset 作用域内组合业务工具、策略和安全 Guard。
+- security.mjs、native-file-policy.mjs：当前会话联网开关、原生文件路径、命令目录、原件只读、权限和后台模式检查。
+- session-files.mjs、session-authority.mjs：从官方已接受消息与原件桥接结果取得授权引用；子代理只继承可信直接父会话。
+- lightrag-tool.mjs：通过受管 FastAPI 调用当前用户知识检索，不直接访问数据库或 LightRAG 内部存储。
+- knowledge-attachments.mjs：当前用户与 Session 校验后，把知识原件流入官方 AttachmentStore；只桥接，不解析。
+- knowledge-delegation.mjs：复用官方前台单层子代理、父模型、原生并发和清理；不能扩大父权限。
+- anysearch-provider.mjs、public-web-fetch-provider.mjs、business-registry-tool.mjs：现有受控公开信息能力，服从父会话实时联网开关。
+- prompts/：证据、原生办公、身份、不可信文档和失败行为的独立模板。
+- document-render.mjs、document-render-policy.mjs：在当前 Session 文件授权下只调用固定官方 LibreOffice Kit renderImages，自动输出业务目录；不接受可执行代码、任意输出路径或升权，不自行解析/绘制。原生 read_image 与 present 继续负责看图和交付。
 
-## 运行变量
+文件上传、读取、Office 技能、PowerShell/Bash、PDF 工作流和交付使用 Harness 原生工具。read_chat_file、read_chat_pdf_pages、analyze_xlsx 与重复解析插件已退役；只补受控官方渲染 API 入口，不保留服务器 XLSX Worker 或自定义 PDF 解析/绘制。
 
-- `ADMINSMART_AGENT_API_BASE`：FastAPI 内部 API 根地址。
-- `ADMINSMART_AGENT_USER_ID`：由受管 Harness 进程绑定的可信用户 ID。
-- `ADMINSMART_AGENT_TOKEN_FILE`：当前用户 Runtime 的签名能力凭证文件；插件按工具调用实时读取。
-- `ADMINSMART_AGENT_MODEL_TOKEN`：Harness 模型适配器调用 FastAPI 回环模型代理的同一 Runtime 能力凭证。
-- `ADMINSMART_AGENT_PRESET_ROOT`：AdminSmart 只读业务 Agent preset 根目录。
-- `ADMINSMART_DSH_ROOT`：只读 DeepSeek Harness 官方源码与构建产物目录。
+## 业务文件范围
 
-能力凭证由独立 Gateway 按 `环境 + Profile + 用户 + Runtime` 签发，不是所有用户共享的静态 token。
-真实模型 API Key 只保存在当前 FastAPI 环境，Harness 通过 `/internal/agent-model/v1/chat/completions`
-流式代理访问模型。
+业务工作目录由 Gateway 的 ADMINSMART_AGENT_BUSINESS_ROOT 注入，解释器由 ADMINSMART_OFFICE_PYTHON 指定。脚本与结果可写该目录；当前会话附件、受管知识原件及官方技能资源只读。开发与生产使用同一实现，身份、凭据、Home 和数据由 Gateway 按环境、用户、管理员角色及模式分离。
+
+普通文件工具检查真实路径；命令保持 workspace-write、限时前台运行，不准升级或后台常驻。同模式权限字段只允许 SDK 的 no-op，理由不能为空。
+
+用户选择不用容器。官方 Windows 沙箱只提供部分写入限制，业务区外读取及命令联网主要依赖提示词；不能宣称 OS 读取、网络或跨用户命令隔离。真实合成 canary 测试专门记录读取缺口，而不是把可读取误报为安全通过。
+
+## 验证
+
+npm run check 执行语法、真实官方 Preset 装配、文件 Guard、官方命令 SDK/Windows 写入沙箱、父子会话、知识桥接、公开信息、证据和提示词目标测试。自动测试不访问真实用户文件、生产数据库、模型或外部服务。
+
+运行代码变化后还须 validate、stop/start、修订一致与真实签名用户 Runtime 冷启动。业务权限和解析能力不能仅凭页面隐藏或模型自述判断。
+
+详细迁移、实际目录和边界见后端 docs/native-file-qa-migration.md。

@@ -1,14 +1,22 @@
 {
   "name": "@adminsmart/dsh-knowledge-plugin",
+  "description": "AdminSmart 知识库业务权限与检索集成；文件、办公和命令使用 Harness 官方能力。",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "main": "./src/index.mjs",
   "exports": {
     ".": "./src/index.mjs",
+    "./security": "./src/security.mjs",
+    "./knowledge-policy": "./src/knowledge-policy.mjs",
+    "./knowledge-attachments": "./src/knowledge-attachments.mjs",
+    "./lightrag-tool": "./src/lightrag-tool.mjs",
+    "./lightrag-tools": "./src/lightrag-tool.mjs",
+    "./anysearch-provider": "./src/anysearch-provider.mjs",
+    "./public-web-fetch-provider": "./src/public-web-fetch-provider.mjs",
     "./package.json": "./package.json"
   },
   "scripts": {
-    "check": "node --check src/index.mjs && node tests/plugin-contract.test.mjs"
+    "check": "node --check src/index.mjs && node --check src/security.mjs && node --check src/native-file-policy.mjs && node --check src/document-render-policy.mjs && node --check src/document-render.mjs && node --check src/session-files.mjs && node --test tests/native-file-policy.test.mjs tests/document-render.test.mjs tests/native-command.test.mjs tests/native-delegation.test.mjs tests/knowledge-attachments.test.mjs tests/anysearch-provider.test.mjs tests/public-web-fetch-provider.test.mjs && node tests/agent-preset-registration.test.mjs && node tests/business-registry-tool.test.mjs && node tests/knowledge-first.test.mjs && node tests/plugin-contract.test.mjs && node tests/knowledge-behavior-contract.test.mjs && node tests/prompt-contract.test.mjs"
   }
 }

@@ -1,0 +1,52 @@
+# AuraSearch 知识 Agent Preset。
+# Agent Loop、模型适配和 Web Client 来自固定 Runtime Profile；安全、证据策略和多个 LightRAG Tool 由一个业务插件在同一 Agent scope 内组合。
+
+- id: adminsmart-knowledge-agent
+  name: '__ADMINSMART_KNOWLEDGE_AGENT_PLUGIN_URI__'
+
+# 文件问答与办公处理全部使用固定版官方工具，不注册自定义解析。
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+  config:
+    enableRunInBackground: false
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+  config:
+    enableRunInBackground: false
+- id: skill-office
+  name: '@deepseek-ai/dsh-skill-office'
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+- id: present
+  name: '@deepseek-ai/dsh-tool-present'
+
+# Harness 官方 Web Tool 在知识 Agent 内同时提供官方 `web_search` 与安全网页读取；Provider 由 AdminSmart 通过公开 ctx.web seam 注入。
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    search: true
+    fetch: true
+    fetchTimeoutMs: 30000
+    fetchMaxOutputChars: 30000
+
+# 长会话使用 Harness 官方压缩服务；工具结果裁剪只影响旧上下文，不改变当前检索证据。
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 32768
+        headChars: 16384
+        tailChars: 4096
