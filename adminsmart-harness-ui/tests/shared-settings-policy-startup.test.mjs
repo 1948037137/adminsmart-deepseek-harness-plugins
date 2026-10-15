@@ -35,6 +35,7 @@ function deferred() {
  * @param {import('node:test').TestContext} t 当前测试拥有的全局fetch替身。
  * @param {object} options 合成启动和响应条件。
  * @param {'light'|'dark'} [options.theme] 管理员已发布的权威主题。
+ * @param {'light'|'dark'} [options.personalTheme] 当前本人原生持久化偏好，独立于历史共享颜色。
  * @param {boolean} [options.systemDark] 与权威值相反的操作系统主题。
  * @param {boolean} [options.holdPolicy] 扣住共享GET的回答。
  * @param {boolean} [options.holdSchema] 扣住官方Schema describe的回答。
@@ -46,7 +47,7 @@ function deferred() {
  * @returns {Promise<object>} 原始fiber、消费者和可控响应；无真实用户或外部服务。
  */
 async function fixture(t, {
-  theme = 'light', systemDark = true, holdPolicy = false, holdSchema = false,
+  theme = 'light', personalTheme = 'light', systemDark = true, holdPolicy = false, holdSchema = false,
   expirePolicy = false, empty = false, responseStatus = 200, corrupt = false, missingSchema = false,
 } = {}) {
   const require = createRequire(pathToFileURL(resolve(runtimeRoot, 'package.json'))) // 固定SDK的公开包入口解析器。
@@ -76,7 +77,7 @@ async function fixture(t, {
   const timeouts = [] // 正式bounded实际使用的共同截止时间剩余预算。
   const document = { // 官方boot脚本已完成的非敏感DOM状态与资源载入边界。
     documentElement: { dataset: { dsThemeSource: theme } }, // 浅/深主题取自官方boot，ThemeRuntime不会读取此偏好。
-    body: { style: { getPropertyValue: () => '17px' } }, // 原始官方Theme读取首屏字号，避免Fixture掩盖默认字号问题。
+    body: { style: { getPropertyValue: name => name === '--dsh-content-font-size' ? '17px' : '' } }, // 原始 Theme 按 CSS 变量名读取首屏内容字号；其它字体输入保留官方默认。
     querySelector: () => null, // 原始模块CSS可按公开生命周期注册，不依赖任何哈希选择器。
     createElement: () => ({ dataset: {} }), // CSS元素仅作为生命周期对象，不创建浏览器。
     head: { appendChild() {} }, // 原始CSS注册不影响本测试主题状态断言。
@@ -84,7 +85,7 @@ async function fixture(t, {
 
   /** @param {string} name 官方包名。 @returns {Promise<object>} 原封不动的公开Client Bundle导出。 */
   async function loadOriginal(name) {
-    assert.equal(require(name + '/package.json').version, '0.2.1-alpha.1')
+    assert.equal(require(name + '/package.json').version, '0.2.1-alpha.3')
     const file = require.resolve(name + '/client') // 固定SDK公开Client subpath，禁止抽取或改写内部类。
     let record // 原始Bundle的官方load登记。
     runInNewContext(await readFile(file, 'utf8'), {
@@ -103,6 +104,7 @@ async function fixture(t, {
 
   const official = await loadOriginal('@deepseek-ai/dsh-client-ui-settings') // 原始服务必须由wrapper同一fiber执行apply。
   const themeModule = await loadOriginal('@deepseek-ai/dsh-client-ui-theme') // 实际ThemeRuntime，而非仿造主题默认或adopt实现。
+  const themeSchema = (await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-client-ui-theme')).href)).Config.toJSON() // 首次主题消费者使用当前公开官方 Schema，包括新增字体输入默认值。
   const remote = { // 官方Settings读取合同与原始memory条件保持真实，不伪造loopback能力。
     $host: { isLoopback: false }, // 合成公网事实，用来证明受管facade跨环境一致。
     $on: noOperation, // 只由显式Fixture回答触发启动，不连接真实事件服务。
@@ -110,11 +112,16 @@ async function fixture(t, {
       async describe() {
         schemas += 1
         await schemaGate.promise
-        return { ok: true, value: { writable: false, hasDocument: false, namespaces: GENERAL_SETTINGS_NAMESPACES.filter(ns => !missingSchema || ns !== 'ui-chat').map(ns => ({ ns: ns === 'ui-settings' ? 'adminsmart-shared-settings' : ns, schema: { type: 'object', dict: {} }, value: {}, revision: 1, applies: 'live', secrets: [] })) } }
+        return { ok: true, value: { writable: false, hasDocument: false, namespaces: GENERAL_SETTINGS_NAMESPACES.filter(ns => !missingSchema || ns !== 'ui-chat').map(ns => ({ ns: ns === 'ui-settings' ? 'adminsmart-shared-settings' : ns, schema: ns === 'ui-theme' ? themeSchema : { type: 'object', dict: {} }, value: ns === 'ui-theme' ? { preference: personalTheme } : {}, revision: 1, applies: 'live', secrets: [] })) } }
       },
     },
   }
   t.mock.method(globalThis, 'fetch', async (url, request) => {
+    if (url === './adminsmart/native-policy') {
+      assert.equal(request.method, 'GET')
+      await policyGate.promise
+      return { ok: true, status: 200, json: async () => ({ revision: 0, settings: null, writable: false }) } // 合法未发布Native策略，不补默认，仍受同一首次读取门禁。
+    }
     assert.equal(url, './adminsmart/ui-policy')
     assert.equal(request.method, 'GET')
     reads += 1
@@ -127,16 +134,20 @@ async function fixture(t, {
   })
   ctx.provide('remote', remote)
   ctx.provide('remote.settings', remote.settings)
-  ctx.provide('slots', { inject: (_name, register) => register(), register: noOperation })
+  ctx.provide('slots', { inject: (_name, register) => register(), register: noOperation, subscribe: noOperation, entries: () => [] }) // Native只使用公开Slot目录，没有真实浏览器或折叠设置。
   let record // 正式wrapper原始load登记，动态导入只映射到正式自有模块。
   const file = new URL('../shared-settings/client.js', import.meta.url) // 唯一正式提供方源文件。
   runInNewContext(await readFile(file, 'utf8'), {
     window: { location: { href: 'http://fixture.example/runtime/' }, __ModuleLoader__: { load(value) { record = value } } },
     document, URL, AbortController,
     Date: expirePolicy ? { now: () => now } : Date, // 仅超时用例控制绝对时间，正常用例使用真实有界时钟。
-    setTimeout(callback, delay) { timeouts.push(delay); return setTimeout(callback, expirePolicy && timeouts.length === 3 ? 10 : delay) }, // 只缩短最后pending门禁，不给前两个阶段虚假失败。
+    setTimeout(callback, delay) { timeouts.push(delay); return setTimeout(callback, expirePolicy && timeouts.length === 4 ? 10 : delay) }, // 三模块代码确认后只缩短最后共同pending门禁，不令模块阶段虚假失败。
     clearTimeout, setInterval, clearInterval,
-  }, { filename: file.pathname, importModuleDynamically: async specifier => { assert.equal(specifier, 'http://fixture.example/runtime/adminsmart/ui-policy-client.mjs'); return import('../src/ui-policy-client.mjs') } })
+  }, { filename: file.pathname, importModuleDynamically: async specifier => {
+    if (specifier === 'http://fixture.example/runtime/adminsmart/native-policy-client.mjs') return import('../src/native-policy-client.mjs')
+    assert.equal(specifier, 'http://fixture.example/runtime/adminsmart/ui-policy-client.mjs')
+    return import('../src/ui-policy-client.mjs')
+  } })
   const module = record.factory(dependency => { assert.equal(dependency, 'react/jsx-runtime'); return require(dependency) }) // 使用固定SDK同一React平台实例。
   const consumer = ctx.plugin({
     inject: ['configForms'], // 真正的官方服务依赖门，不手动等待bridge.ready来掩盖正式竞态。
@@ -152,13 +163,13 @@ async function fixture(t, {
   }
 }
 
-for (const choice of [{ theme: 'light', systemDark: true }, { theme: 'dark', systemDark: false }]) {
-  test(`共享${choice.theme}与系统相反时，GET及Schema均确认后才激活原始Theme首个快照`, { skip: !runtimeRoot, timeout: 2_000 }, async t => {
+for (const choice of [{ theme: 'dark', personalTheme: 'light', systemDark: true }, { theme: 'light', personalTheme: 'dark', systemDark: false }]) {
+  test(`本人${choice.personalTheme}与历史共享及系统相反时，GET及Schema均确认后才激活原始Theme首个快照`, { skip: !runtimeRoot, timeout: 2_000 }, async t => {
     const state = await fixture(t, { ...choice, holdPolicy: true, holdSchema: true }) // 两个相互独立的必需回答分别扣住。
     try {
       await new Promise(resolve => setImmediate(resolve))
       assert.equal(state.reads, 1)
-      assert.equal(state.schemas, 1)
+      assert.equal(state.schemas, 3) // alpha.3官方SettingsDescribeMirror首次eager describe，加上两受管策略描述；不能为少一次读取屏蔽官方同步。
       assert.equal(state.activated, 0)
       assert.equal(state.ctx.get('configForms'), undefined)
       if (choice.theme === 'light') state.releasePolicy()
@@ -171,9 +182,9 @@ for (const choice of [{ theme: 'light', systemDark: true }, { theme: 'dark', sys
       await state.fiber.await()
       await state.consumer.await()
       assert.equal(state.activated, 1)
-      assert.equal(state.firstTheme.preference, choice.theme)
-      assert.equal(state.firstTheme.active.colorScheme, choice.theme)
-      assert.equal(state.firstTheme.fontSize, 17)
+      assert.equal(state.firstTheme.preference, choice.personalTheme)
+      assert.equal(state.firstTheme.active.colorScheme, choice.personalTheme)
+      assert.equal(state.firstTheme.fontSizes.text, 17)
       assert.equal(state.ctx.get('configForms').get('ui-theme').getSnapshot().status, 'ready')
     } finally { state.releasePolicy(); state.releaseSchema(); await state.dispose() }
   })
@@ -200,7 +211,7 @@ test('合法未发布revision 0/null确认后保留官方默认状态且不阻�
     const form = state.ctx.get('configForms').get('ui-theme').getSnapshot() // 保留既有空策略的loading/value undefined/writable false协议。
     assert.equal(form.status, 'loading')
     assert.equal(form.value, undefined)
-    assert.equal(form.revision, 0)
+    assert.equal(Number.isSafeInteger(form.revision) && form.revision >= 0, true) // 复合scope修订属于页面防旧草稿，不等于未发布General后端revision0。
     assert.equal(form.writable, false)
   } finally { await state.dispose() }
 })
@@ -209,7 +220,7 @@ test('首次GET门禁沿用剩余500ms预算，超时与迟到回答不能提供
   const state = await fixture(t, { holdPolicy: true, expirePolicy: true }) // 最后一段预算由合成10ms触发，无需真实等待五秒。
   try {
     await assert.rejects(() => state.fiber.await(), /共享设置首次读取失败或超时/u)
-    assert.deepEqual(state.timeouts, [5_000, 500, 500])
+    assert.deepEqual(state.timeouts, [5_000, 5_000, 5_000, 500])
     assert.equal(state.activated, 0)
     assert.equal(state.ctx.get('configForms'), undefined)
     state.releasePolicy()

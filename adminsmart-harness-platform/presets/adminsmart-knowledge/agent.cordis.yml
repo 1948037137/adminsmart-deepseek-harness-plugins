@@ -19,6 +19,8 @@
     enableRunInBackground: false
 - id: skill-office
   name: '@deepseek-ai/dsh-skill-office'
+  config:
+    cli: false # 官方公开配置禁用命令行渲染；页面检查仅使用会话授权的受控 render_document。
 - id: tool-skill
   name: '@deepseek-ai/dsh-tool-skill'
 - id: present

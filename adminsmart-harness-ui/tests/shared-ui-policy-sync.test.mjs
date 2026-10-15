@@ -13,7 +13,7 @@ import './read-only-settings-owned.test.mjs'
 
 import { captureGeneralSettings, installSharedUiPolicy } from '../src/shared-ui-policy.mjs'
 
-const initial = { locale: 'zh', theme: 'dark', fontSize: 15, transcriptView: 'expanded', performanceUsage: 'compact', developerTools: false, busyEnter: 'steer', linkOpening: 'new-tab' } // Explicit administrator General choices.
+const initial = { locale: 'zh', theme: 'light', fontSize: 15, transcriptView: 'expanded', performanceUsage: 'compact', developerTools: false, busyEnter: 'steer', linkOpening: 'new-tab' } // Explicit administrator General choices.
 
 /** @param {object} values Complete policy-like native values. @returns {object} Official SettingsForms fake with only General descriptors. */
 function settingsFixture(values) {
@@ -67,14 +67,15 @@ test('administrator publishes saved native settings; ordinary user adopts withou
     await new Promise(resolve => setTimeout(resolve, 10))
     assert.equal(writes.length, 1)
     assert.deepEqual(remote.settings, initial)
-    admin.settings.entries.set('ui-theme', { preference: 'light', fontSize: 15 }) // Official administrator form commits a live choice.
+    admin.settings.entries.set('ui-theme', { preference: 'dark', fontSize: 16 }) // Official administrator form commits a live choice.
     admin.changed('ui-theme')
     await new Promise(resolve => setTimeout(resolve, 260))
     assert.equal(writes.length, 2)
     assert.equal(remote.settings.theme, 'light')
+    assert.equal(remote.settings.fontSize, 16)
     installSharedUiPolicy(ordinary, { ...options, userId: '8', isAdmin: false })
     await new Promise(resolve => setTimeout(resolve, 10))
-    assert.deepEqual(captureGeneralSettings(ordinary.settings), remote.settings)
+    assert.deepEqual(captureGeneralSettings(ordinary.settings, remote.settings.theme), remote.settings)
     assert.equal(writes.length, 2, 'ordinary Runtime must never publish or change the shared policy')
   } finally {
     admin.close()
@@ -103,13 +104,13 @@ test('a stale administrator adopts a newer policy after a revision conflict', as
   try {
     installSharedUiPolicy(admin, options)
     await new Promise(resolve => setTimeout(resolve, 10))
-    admin.settings.entries.set('ui-theme', { preference: 'light', fontSize: 15 }) // This local edit loses the CAS race.
+    admin.settings.entries.set('ui-theme', { preference: 'dark', fontSize: 16 }) // This local edit loses the CAS race.
     admin.changed('ui-theme')
     await new Promise(resolve => setTimeout(resolve, 240))
     assert.equal(writes, 1)
     tick() // Next ordinary poll must adopt revision two, not retry the stale write.
     await new Promise(resolve => setTimeout(resolve, 10))
-    assert.equal(captureGeneralSettings(admin.settings).theme, 'system')
+    assert.equal(admin.settings.entries.get('ui-theme').preference, 'dark', '历史全站主题不能覆盖本人选择')
     assert.equal(writes, 1)
   } finally {
     admin.close()

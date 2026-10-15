@@ -18,7 +18,7 @@ const ARGUMENT_NAMES = new Set(['file_path', 'pages', 'sheet', 'range']) // 输�
 /**
  * 校验原生工具参数并确定固定渲染请求；多余属性不能在官方 Schema 外偷偷生效。
  * @param {object} args 模型请求，仅允许路径、最多三页或表格区域。
- * @returns {{filePath:string,extension:string,pages?:number[],sheet?:string,range?:string}} 规范化选择。
+ * @returns {{filePath:string,extension:string,pages?:number[],sheet?:string,range?:string,skippedReason?:string}} 规范化选择；表格未指定范围时明确终止视觉检查。
  * @throws {Error} 任意越权字段、格式、页码或区域无效时拒绝，尚不读取源文件。
  */
 export function renderSelection(args) {
@@ -31,12 +31,16 @@ export function renderSelection(args) {
   if (!SUPPORTED_EXTENSIONS.has(extension)) throw new Error('官方页面渲染不支持此文件格式')
   if (WORKBOOK_EXTENSIONS.has(extension)) {
     if (args.pages !== undefined && (!Array.isArray(args.pages) || args.pages.length !== 0)) throw new Error('表格请使用工作表和单元格范围，不传页码')
+    if (sheet === undefined) {
+      if (range !== undefined) throw new Error('表格区域必须同时指定实际工作表名称')
+      return { filePath, extension, skippedReason: '表格未指定实际工作表，本次不自动渲染全部工作表。需要视觉核验时先用官方办公工作流确认工作表名称，再指定 sheet。' } // 官方技能默认请求允许明确skipped，不能为无页码调用擅自扩大为整本表格。
+    }
     if (typeof sheet !== 'string' || !sheet.trim() || sheet.length > 128 || /[\0\r\n]/u.test(sheet)) throw new Error('表格渲染必须指定实际工作表名称')
     if (range !== undefined && (typeof range !== 'string' || !/^[A-Z]{1,3}[1-9]\d{0,6}(?::[A-Z]{1,3}[1-9]\d{0,6})?$/u.test(range))) throw new Error('表格区域必须是有效的 A1 单元格矩形')
     return { filePath, extension, sheet, ...(range === undefined ? {} : { range }) }
   }
   if (sheet !== undefined || range !== undefined) throw new Error('非表格文件请使用页码，不传工作表或单元格范围')
-  const pages = args.pages === undefined ? [1] : args.pages // 未指定只看第一页并返回总页数，后续由模型按需要选择。
+  const pages = args.pages === undefined || (Array.isArray(args.pages) && args.pages.length === 0) ? [1] : args.pages // 官方技能会省略页码或补空数组；都仅看第一页，不扩大为全部页面。
   if (!Array.isArray(pages) || !pages.length || pages.length > MAX_RENDER_IMAGES || pages.some(page => !Number.isSafeInteger(page) || page < 1 || page > 10_000) || new Set(pages).size !== pages.length) throw new Error('每次请选择一到三个不同的正整数页码')
   return { filePath, extension, pages }
 }
@@ -55,9 +59,10 @@ export function authorizedRenderSource(ctx, execution) {
   const policy = ctx.sandboxPolicy.resolve({ session: execution.agent.session }) // 专用入口仍要求当前会话保留原 workspace-write 状态。
   if (policy.mode !== 'workspace-write' || realpathSync(resolve(policy.workspaceRoot)) !== root) throw new Error('当前页面渲染不属于受管业务目录')
   if (!permitsPath(ctx, execution, selection.filePath)) throw new Error('页面渲染文件不属于业务目录或当前会话附件')
-  const path = realpathSync(resolve(root, selection.filePath)) // 必须已经存在的规范路径，不接受待创建输入。
+  const currentDirectory = ctx.get?.('workingDirectory')?.get(execution.agent.session) ?? root // 与原生文件工具及路径Guard采用同一可信Session目录，目录切换不改变原业务根。
+  const path = realpathSync(resolve(currentDirectory, selection.filePath)) // 检查和读取同一实际文件，不把子目录相对路径误定位到业务根的同名原件。
   if (within(root, path)) return { root, path, selection }
-  for (const reference of sessionFiles(execution.agent.session).values()) {
+  for (const reference of sessionFiles(execution.agent.session, ctx.sessionProjections).values()) {
     if (!reference.mediaType && ctx.attachments.fileHostPath(reference) && realpathSync(ctx.attachments.fileHostPath(reference)) === path) return { root, path, reference, selection }
   }
   throw new Error('页面渲染只能处理当前业务文件或本会话已授权附件')

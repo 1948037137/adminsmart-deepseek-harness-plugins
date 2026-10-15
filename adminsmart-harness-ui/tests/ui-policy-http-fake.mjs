@@ -1,9 +1,11 @@
 /** 有限 UI 策略 HTTP 桥的离线权限与传输回归，不启动 HTTP/Gateway 或访问真实后端。 */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
-import { UI_POLICY_CLIENT_ROUTE, UI_POLICY_ROUTE, installUiPolicyHttp, requestUiPolicy } from '../src/ui-policy-http.mjs'
+import { UI_POLICY_CLIENT_REVISION_GLOBAL, UI_POLICY_CLIENT_ROUTE, UI_POLICY_ROUTE, installUiPolicyHttp, requestUiPolicy } from '../src/ui-policy-http.mjs'
 
 const POLICY = Object.freeze({
   locale: 'zh', // 合成语言选择。
@@ -28,11 +30,12 @@ function signedOptions(admin = true) {
   }
 }
 
-/** @param {object} t 测试上下文。 @param {boolean} admin 可信服务端角色。 @returns {object} 直接调用路由的离线 HTTP 协议 Fake。 */
-function routeFixture(t, admin = true) {
+/** @param {object} t 测试上下文。 @param {boolean} admin 可信服务端角色。 @param {Buffer} clientModuleSource 固定代码字节 Fixture。 @returns {object} 直接调用路由的离线 HTTP 协议 Fake。 */
+function routeFixture(t, admin = true, clientModuleSource = Buffer.from('export const fixture = true\n')) {
   const routes = new Map() // 捕获官方 webServer.register 的精确路由。
   const state = { remote: { revision: 3, settings: { ...POLICY } }, calls: [], bodyReads: 0, status: 200 } // 内存后端与请求观测，不建立数据库。
   const disposers = [] // effect 释放每个路由。
+  const pageInjections = [] // 捕获官方初始化表，不读取浏览器或真实用户配置。
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     state.calls.push({ url, options })
     assert.equal(url, 'http://backend.invalid/internal/agent-model/v1/ui-policy')
@@ -50,6 +53,7 @@ function routeFixture(t, admin = true) {
     return { ok: true, json: async () => structuredClone(state.remote), headers: { get: () => state.delivery ?? null } }
   })
   const ctx = {
+    on(event, listener) { assert.equal(event, 'webserver/index-inject'); listener(pageInjections); return () => { pageInjections.length = 0 } }, // 初始化只注入可信代码版本，卸载同时释放。
     webServer: { register(route) { assert.equal(route.kind, 'exact'); routes.set(route.path, route); return () => routes.delete(route.path) } },
     effect(register) { disposers.push(register()) },
   } // 不创建官方 Web Server，也不启动 Gateway。
@@ -61,12 +65,12 @@ function routeFixture(t, admin = true) {
       if (Buffer.byteLength(request.body ?? '', 'utf8') > maximumBytes) throw new Error('fixture oversized body')
       return JSON.parse(request.body)
     },
-    readClientModule: async () => 'export const fixture = true\n', // 固定自有资源内容 Fake，不读用户文件或第三方构建文件。
+    clientModuleSource, // 固定自有代码快照 Fake，不读用户文件或第三方构建文件。
   })
   /** @param {string} path 精确注册路径。 @param {string} method HTTP 方法。 @param {object|undefined} body 输入 JSON。 @param {object} headers 浏览器 Header Fixture。 @returns {Promise<object>} 安全响应。 */
   async function invoke(path, method = 'GET', body, headers = {}) {
     const output = { status: null, headers: null, body: undefined } // Node ServerResponse 协议的最小观测值。
-    await routes.get(path).handler({ method, headers: { 'sec-fetch-site': 'same-origin', ...headers }, body: body === undefined ? undefined : JSON.stringify(body) }, {
+    await routes.get(new URL(path, 'http://fixture.invalid').pathname).handler({ method, url: path, headers: { 'sec-fetch-site': 'same-origin', ...headers }, body: body === undefined ? undefined : JSON.stringify(body) }, {
       writeHead(status, responseHeaders) { output.status = status; output.headers = responseHeaders },
       end(content) { output.body = content },
     })
@@ -74,7 +78,7 @@ function routeFixture(t, admin = true) {
   }
   const close = () => { for (const dispose of disposers) dispose() } // 当前测试只卸载自己的两个路由。
   t.after(close)
-  return { routes, state, invoke, close }
+  return { routes, state, pageInjections, invoke, close }
 }
 
 test('管理员 GET/PUT 只传 General 与 CAS，身份由服务端绑定，响应没有凭据', async t => {
@@ -154,11 +158,43 @@ test('固定 JS 资源只允许 GET/HEAD，卸载后路由清理，不包含身�
   assert.equal(source.status, 200)
   assert.equal(source.headers['content-type'], 'text/javascript; charset=utf-8')
   assert.equal(source.headers['x-content-type-options'], 'nosniff')
+  assert.equal(source.headers['cache-control'], 'no-store')
   assert.equal((await fixture.invoke(UI_POLICY_CLIENT_ROUTE, 'HEAD')).body, undefined)
   assert.equal((await fixture.invoke(UI_POLICY_CLIENT_ROUTE, 'POST')).status, 405)
   assert.equal(fixture.state.calls.length, 0)
   fixture.close()
   assert.equal(fixture.routes.size, 0)
+  assert.equal(fixture.pageInjections.length, 0)
+})
+
+for (const isAdmin of [true, false]) test(`纯静态模块可信SHA缓存与原字节/HEAD一致，角色=${isAdmin ? 'admin' : 'managed-user'}，策略仍不缓存`, async t => {
+  const original = await readFile(new URL('../src/ui-policy-client.mjs', import.meta.url)) // 正式纯模块代码，不加载凭据、会话或后端状态。
+  const mutable = Buffer.from(original) // 验证 Host 拷贝后外部 Buffer 修改不能改变哈希对应的响应。
+  const fixture = routeFixture(t, isAdmin, mutable) // 两个角色使用相同静态代码与缓存协议。
+  const revision = createHash('sha256').update(original).digest('hex') // 独立按正式响应字节计算预期哈希。
+  assert.deepEqual(fixture.pageInjections, [{ kind: 'html', placement: 'head', html: '<link rel="modulepreload" crossorigin href=".' + UI_POLICY_CLIENT_ROUTE + '?rev=' + revision + '">' }, { kind: 'global', name: UI_POLICY_CLIENT_REVISION_GLOBAL, value: revision }]) // 两角色使用完全相同静态URL，预载不访问政策或扩大写权限。
+  mutable.fill(0)
+  const versioned = `${UI_POLICY_CLIENT_ROUTE}?rev=${revision}` // 只接受 Host 注入的当前版本，不用共享策略 revision。
+  for (const method of ['GET', 'HEAD']) {
+    const response = await fixture.invoke(versioned, method) // HEAD 必须与 GET 有相同实体元数据。
+    assert.equal(response.status, 200)
+    assert.equal(response.headers['cache-control'], 'private, max-age=31536000, immutable')
+    assert.equal(response.headers['content-length'], String(original.byteLength))
+    assert.equal(response.headers['set-cookie'], undefined)
+    if (method === 'GET') assert.deepEqual(response.body, original)
+    else assert.equal(response.body, undefined)
+  }
+  for (const suffix of ['?rev=', `?rev=${'a'.repeat(64)}`, '?rev=malformed', `?rev=${revision}&rev=${revision}`]) {
+    const stale = await fixture.invoke(UI_POLICY_CLIENT_ROUTE + suffix) // 空、旧、非法或重复版本不得以当前字节冒充历史代码。
+    assert.equal(stale.status, 410)
+    assert.equal(stale.headers['cache-control'], 'no-store')
+    assert.equal(stale.body, undefined)
+  }
+  assert.equal(fixture.state.calls.length, 0)
+  const policy = await fixture.invoke(`${UI_POLICY_ROUTE}?rev=${revision}`) // 静态版本参数不能使动态策略获得缓存或跳过身份读取。
+  assert.equal(policy.headers['cache-control'], 'no-store')
+  assert.equal(fixture.state.calls.length, 1)
+  assert.equal(JSON.parse(policy.body).writable, isAdmin)
 })
 
 test('服务端直接调用也不能越过角色或白名单，传输失败转换为安全错误', async t => {

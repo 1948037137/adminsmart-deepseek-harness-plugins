@@ -1,9 +1,11 @@
 /** 签名快捷键同源HTTP桥；浏览器不能选择身份、目标URL、路径或动作。 */
 import { shortcutDocument } from './shared-shortcuts-client.mjs'
+import { createHash } from 'node:crypto'
 
 export const SHORTCUT_POLICY_ROUTE = '/adminsmart/shortcut-policy' // 当前Runtime固定偏好GET/PUT路径。
 export const SHORTCUT_POLICY_EVENTS_ROUTE = '/adminsmart/shortcut-policy/events' // 当前Runtime固定失效事件流。
 export const SHORTCUT_POLICY_CLIENT_ROUTE = '/adminsmart/shared-shortcuts-client.mjs' // 自有canonical纯浏览器factory固定资源。
+export const SHORTCUT_POLICY_CLIENT_REVISION_GLOBAL = '__ADMINSMART_SHARED_SHORTCUTS_CLIENT_REVISION__' // Host在官方IndexInjection中公开的固定代码SHA，不携带策略或身份。
 const MAXIMUM_BYTES = 32_768 // 当前官方指令/六设备文档的有限传输预算。
 const REQUEST_TIMEOUT_MS = 5_000 // 单次回环数据库接口的有界等待。
 const STREAM_TIMEOUT_MS = 70_000 // 官方内部租约流六十秒结束，Host额外限制异常连接。
@@ -134,16 +136,29 @@ const sendError = (response, error) => {
 
 /**
  * 在既有Host安装固定同源GET/PUT/SSE和自有factory资源，不开启任意代理。
- * @param {object} ctx 官方Context，仅用公开effect/webServer.register。
+ * @param {object} ctx 官方Context，仅用公开effect/on/webServer.register。
  * @param {object} options 服务端可信Runtime装配，不接受浏览器role/user。
  * @param {object} helpers 同源、有界JSON、固定资源及公开官方protocol。
  * @param {Function} helpers.assertSameOrigin 既有Gateway同源验证。
  * @param {Function} helpers.readJsonBody 既有有界请求体解析。
- * @param {Function} helpers.readClientModule 唯一canonical自有浏览器factory源码读取。
+ * @param {string|Buffer} [helpers.clientModuleSource] 根在启动前读取的固定canonical代码字节；立即复制，以同一快照生成SHA和响应。
+ * @param {Function} [helpers.readClientModule] 旧Fixture的legacy读取回调；缺启动快照时不注入版本、不开放版本缓存。
  * @param {object} helpers.protocol 当前固定版本官方./protocol导出。
  * @returns {void} 所有路由由Cordis effect卸载，SSE自行限制生命周期。
  */
 export function installShortcutPolicyHttp(ctx, options, helpers) {
+  const clientModuleSource = helpers.clientModuleSource === undefined ? null : Buffer.from(helpers.clientModuleSource) // 当前启动不可变代码快照，外部Buffer后续变化不能使SHA与字节分离。
+  const clientModuleRevision = clientModuleSource === null ? null : createHash('sha256').update(clientModuleSource).digest('hex') // 仅固定代码身份；legacy Fixture不以迟到文件内容冒充启动版本。
+  if (clientModuleRevision !== null) ctx.effect(() => ctx.on('webserver/index-inject', table => {
+    const preload = '<link rel="modulepreload" crossorigin href=".' + SHORTCUT_POLICY_CLIENT_ROUTE + '?rev=' + clientModuleRevision + '">' // 只提前下载可信SHA的纯codec模块；不执行指令、编辑键位或获取偏好文档。
+    if (!table.some(row => row.kind === 'html' && row.html === preload))
+      table.unshift({ kind: 'html', placement: 'head', html: preload }) // 同文档只预载一次，官方脚本登记和消费生命周期不变。
+    table.push({
+      kind: 'global', // 官方类型化注入在Client启动前可读，无自造HTML或脚本协议。
+      name: SHORTCUT_POLICY_CLIENT_REVISION_GLOBAL, // Client只读取此受管Host声明，不采纳地址栏查询。
+      value: clientModuleRevision, // 静态代码SHA，不能泄露配置、用户、租约或Token。
+    })
+  }), 'adminsmart-shared-shortcuts: trusted codec revision')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: SHORTCUT_POLICY_ROUTE,
     async handler(request, response) {
       try {
@@ -165,8 +180,19 @@ export function installShortcutPolicyHttp(ctx, options, helpers) {
       try {
         if (!['GET', 'HEAD'].includes(request.method)) throw new ShortcutPolicyHttpError(405, 'agent_shortcut_policy_method', '请求方法不受支持')
         try { helpers.assertSameOrigin(request) } catch { throw new ShortcutPolicyHttpError(403, 'agent_shortcut_policy_origin', '跨站请求已拒绝') }
-        const source = await helpers.readClientModule() // 唯一固定自有factory，不映射任意URL到本地文件。
-        response.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' })
+        const revisions = new URL(request.url || SHORTCUT_POLICY_CLIENT_ROUTE, 'http://runtime.invalid').searchParams.getAll('rev') // 查询只核对当前快照身份，不选择文件或缓存策略。
+        if (revisions.length > 1 || revisions.length === 1 && (clientModuleRevision === null || revisions[0] !== clientModuleRevision)) {
+          response.writeHead(410, { 'cache-control': 'no-store' })
+          response.end()
+          return
+        }
+        const source = clientModuleSource ?? Buffer.from(await helpers.readClientModule()) // 正式启动固定快照优先；旧Fixture仅在未版本化legacy路径读取固定回调。
+        response.writeHead(200, {
+          'content-type': 'text/javascript; charset=utf-8', // 单一固定自有纯模块，不提供任意资源映射。
+          'cache-control': revisions.length === 1 ? 'private, max-age=31536000, immutable' : 'no-store', // 版本代码可在当前浏览器复用；无版本旧入口保持实时读取语义。
+          'content-length': String(source.byteLength), // HEAD与GET描述相同快照字节，压缩由既定Web/Proxy载体处理。
+          'x-content-type-options': 'nosniff', // 不允许浏览器把其它资源类型当代码执行。
+        })
         response.end(request.method === 'HEAD' ? undefined : source)
       } catch (error) { sendError(response, error) }
     },

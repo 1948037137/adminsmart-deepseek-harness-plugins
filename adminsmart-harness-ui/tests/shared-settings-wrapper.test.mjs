@@ -6,7 +6,9 @@ import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { runInNewContext } from 'node:vm'
+import { gunzipSync } from 'node:zlib'
 import { GENERAL_SETTINGS_NAMESPACES } from '../src/ui-policy-client.mjs'
+import { UI_POLICY_CLIENT_REVISION_GLOBAL, installUiPolicyHttp } from '../src/ui-policy-http.mjs'
 import './shared-settings-startup.test.mjs' // 同一正式wrapper检查入口必须覆盖总预算、卸载及迟到响应。
 import './shared-settings-policy-startup.test.mjs' // 权威General读取必须先于真实Cordis消费者与原始Theme首个快照。
 
@@ -26,12 +28,16 @@ test('nested Host保留官方Config/apply，固定资源GET字节不变、HEAD�
   assert.strictEqual(host.Config, official.Config)
   const routes = [] // 公开webServer.register的原样路由。
   let configured = 0 // 官方apply应负责真实Schema注册行为。
-  const ctx = { fiber: { id: 'adminsmart-shared-settings' }, inject(_names, register) { register({ effect: callback => callback(), settings: { configure(options, owner) { assert.deepEqual(options, { auto: false }); assert.strictEqual(owner, ctx.fiber); assert.equal(owner.id, 'adminsmart-shared-settings'); configured += 1 } } }) }, effect: callback => callback(), webServer: { register(route) { routes.push(route); return () => {} } } } // 官方configure直接使用真实owned提供方，不冒用ui-settings身份。
+  let injectRevision // 官方 index 的可信公开代码哈希注入回调。
+  const ctx = { fiber: { id: 'adminsmart-shared-settings' }, on(event, listener) { assert.equal(event, 'webserver/index-inject'); injectRevision = listener; return () => {} }, inject(_names, register) { register({ effect: callback => callback(), settings: { configure(options, owner) { assert.deepEqual(options, { auto: false }); assert.strictEqual(owner, ctx.fiber); assert.equal(owner.id, 'adminsmart-shared-settings'); configured += 1 } } }) }, effect: callback => callback(), webServer: { register(route) { routes.push(route); return () => {} } } } // 官方configure直接使用真实owned提供方，不冒用ui-settings身份。
   host.apply(ctx, {})
   assert.equal(configured, 1)
   assert.equal(routes.length, 1)
   assert.equal(routes[0].path, '/adminsmart/shared-settings/official-client.js')
   const original = await readFile(require.resolve('@deepseek-ai/dsh-client-ui-settings/client')) // 固定官方发布字节，无文件写入。
+  const bootTable = [] // 只允许公开源码身份进入页面，不包含策略或当前用户信息。
+  injectRevision(bootTable)
+  assert.deepEqual(bootTable, [{ kind: 'script-preload', src: '.' + host.OFFICIAL_SETTINGS_CLIENT_ROUTE + '?rev=' + host.OFFICIAL_SETTINGS_CLIENT_REVISION }, { kind: 'global', name: '__ADMINSMART_SHARED_SETTINGS_CLIENT_REVISION__', value: host.OFFICIAL_SETTINGS_CLIENT_REVISION }]) // 下载提示不能执行官方factory或夹带策略/身份。
   for (const method of ['GET', 'HEAD', 'PUT']) {
     const response = { status: undefined, body: undefined, writeHead(status) { this.status = status }, end(body) { this.body = body } } // 隔离HTTP响应。
     await routes[0].handler({ method }, response)
@@ -39,6 +45,18 @@ test('nested Host保留官方Config/apply，固定资源GET字节不变、HEAD�
     if (method === 'GET') assert.deepEqual(response.body, original)
     else assert.equal(response.body, undefined)
   }
+  for (const encoding of ['gzip', 'gzip;q=0']) {
+    const response = { headers: {}, writeHead(status, headers) { this.status = status; this.headers = headers }, end(body) { this.body = body } } // 检查可信版本资源真实编码和缓存头。
+    await routes[0].handler({ method: 'GET', url: `${routes[0].path}?rev=${host.OFFICIAL_SETTINGS_CLIENT_REVISION}`, headers: { 'accept-encoding': encoding } }, response)
+    assert.equal(response.headers['cache-control'], 'private, max-age=31536000, immutable')
+    assert.equal(response.headers.vary, 'Accept-Encoding')
+    assert.deepEqual(encoding === 'gzip' ? gunzipSync(response.body) : response.body, original)
+    assert.equal(response.headers['content-encoding'], encoding === 'gzip' ? 'gzip' : undefined)
+  }
+  const stale = { writeHead(status, headers) { this.status = status; this.headers = headers }, end(body) { this.body = body } } // 旧版本 URL 不得拿到新字节并被永久缓存。
+  await routes[0].handler({ method: 'GET', url: `${routes[0].path}?rev=${'a'.repeat(64)}` }, stale)
+  assert.equal(stale.status, 410)
+  assert.equal(stale.headers['cache-control'], 'no-store')
   const manifest = JSON.parse(await readFile(new URL('../shared-settings/package.json', import.meta.url), 'utf8')) // 正式包根必须具有独立module身份。
   assert.equal(manifest.name, '@adminsmart/dsh-shared-settings')
   assert.equal(manifest.exports['./client'], './client.js')
@@ -77,7 +95,25 @@ test('正式wrapper先script登记真实ModuleSystem，未知导入pending时仍
   let writeStatus = 200 // 当前管理员PUT的隔离结果。
   let delivery = 'delivered' // 后端commit成功之后的合成推送确认。
   let puts = 0 // 拒绝把delayed提交再次重发。
+  let nativeRevision = 0 // Native独立CAS，不能使用General的修订4。
+  let nativeSettings = null // 未发布策略不播种默认，第一次原始Theme操作才提交明确region。
   t.mock.method(globalThis, 'fetch', async (url, request) => {
+    if (url === './adminsmart/native-policy') {
+      if (request.method === 'PUT') {
+        puts += 1
+        if (writeStatus !== 200) return { ok: false, status: writeStatus }
+        const body = JSON.parse(request.body) // 同一个原始Theme操作必须是一个Native请求带两个独立CAS。
+        assert.equal(body.expectedRevision, nativeRevision)
+        assert.equal(body.legacyGeneralUpdate.expectedRevision, policy.revision)
+        nativeRevision += 1
+        nativeSettings = body.settings
+        policy.revision += 1
+        policy.settings = body.legacyGeneralUpdate.settings
+        return { ok: true, headers: { get: () => delivery }, json: async () => ({ revision: nativeRevision, settings: nativeSettings, writable: true, general: { revision: policy.revision, settings: policy.settings } }) }
+      }
+      assert.equal(request.method, 'GET')
+      return { ok: true, status: 200, json: async () => ({ revision: nativeRevision, settings: nativeSettings, writable: true }) } // 新桥没有原生覆盖时仍保留旧General真源，绝不发两次保存。
+    }
     assert.equal(url, './adminsmart/ui-policy')
     if (request.method === 'PUT') {
       puts += 1
@@ -90,12 +126,12 @@ test('正式wrapper先script登记真实ModuleSystem，未知导入pending时仍
     return { ok: true, headers: { get: () => delivery }, json: async () => structuredClone(policy) }
   })
   const registrations = new Map() // 正式wrapper的公开status Slot。
-  const remote = { $host: { isLoopback: false }, $on: () => () => {}, settings: { describe: async () => ({ ok: true, value: { writable: false, hasDocument: false, namespaces: GENERAL_SETTINGS_NAMESPACES.map(ns => ({ ns: ns === 'ui-settings' ? 'adminsmart-shared-settings' : ns, value: { extra: 'fixture-private-extra' }, schema: { type: 'object', dict: {} }, revision: 1, secrets: [], extra: 'fixture-private-extra' })) } }) } } // memory原生条件与真实owned ID；额外源字段不属于共享DTO。
+  const remote = { $host: { isLoopback: false }, $on: () => () => {}, settings: { describe: async () => ({ ok: true, value: { writable: true, hasDocument: false, namespaces: GENERAL_SETTINGS_NAMESPACES.map(ns => ({ ns: ns === 'ui-settings' ? 'adminsmart-shared-settings' : ns, value: { extra: 'fixture-private-extra' }, schema: { type: 'object', dict: {} }, revision: 1, secrets: [], extra: 'fixture-private-extra' })) } }) } } // 管理员可信描述与策略角色一致；额外源字段仍不属于共享DTO。
   const ctx = new cordis.Context() // 实际Cordis根上下文。
   ctx.provide('modules', transport)
   ctx.provide('remote', remote)
   ctx.provide('remote.settings', remote.settings)
-  ctx.provide('slots', { inject: (_name, register) => register(), register: (options, component) => { registrations.set(options.id, { options, component }); return () => {} } })
+  ctx.provide('slots', { inject: (_name, register) => register(), register: (options, component) => { registrations.set(options.id, { options, component }); return () => {} }, subscribe: () => () => {}, entries: () => [] }) // 只声明公开Slot形状，不伪造原始collapse控件。
   let scripts = 0 // 原始Client被固定经典script装载的次数。
   const document = { createElement() {
     const listeners = new Map() // 合成脚本load/error回调。
@@ -109,10 +145,17 @@ test('正式wrapper先script登记真实ModuleSystem，未知导入pending时仍
     queueMicrotask(() => script.listeners.get('load')())
   } } } // 不启动浏览器或HTTP服务。
   const file = new URL('../shared-settings/client.js', import.meta.url) // 正式wrapper原始源文件。
+  const adapterBoot = [] // 正式 Host 注入的纯模块哈希，不手写版本或读取真实页面。
+  installUiPolicyHttp({ effect: register => register(), on(event, listener) { assert.equal(event, 'webserver/index-inject'); listener(adapterBoot); return () => {} }, webServer: { register: () => () => {} } }, {}, { clientModuleSource: await readFile(new URL('../src/ui-policy-client.mjs', import.meta.url)) })
+  const adapterRevision = adapterBoot.find(row => row.name === UI_POLICY_CLIENT_REVISION_GLOBAL).value // Wrapper 必须使用实际 Host index-inject 的代码身份。
   let record // 正式自有Lazy-CJS工厂，不抽取内部实现。
-  runInNewContext(await readFile(file, 'utf8'), { window: { location: { href: 'http://fixture.example/runtime/' }, __ModuleLoader__: { load(value) { record = value } } }, document, URL, AbortController, setTimeout, clearTimeout, setInterval, clearInterval }, {
+  runInNewContext(await readFile(file, 'utf8'), { window: { location: { href: 'http://fixture.example/runtime/?rev=untrusted-page-query' }, [UI_POLICY_CLIENT_REVISION_GLOBAL]: adapterRevision, __ModuleLoader__: { load(value) { record = value } } }, document, URL, AbortController, setTimeout, clearTimeout, setInterval, clearInterval }, {
     filename: file.pathname,
-    importModuleDynamically: async specifier => { assert.equal(specifier, 'http://fixture.example/runtime/adminsmart/ui-policy-client.mjs'); return import('../src/ui-policy-client.mjs') }, // 固定同源纯模块只映射到正式自有代码。
+    importModuleDynamically: async specifier => {
+      if (specifier === 'http://fixture.example/runtime/adminsmart/native-policy-client.mjs') return import('../src/native-policy-client.mjs')
+      assert.equal(specifier, `http://fixture.example/runtime/adminsmart/ui-policy-client.mjs?rev=${adapterRevision}`)
+      return import('../src/ui-policy-client.mjs')
+    }, // 三模块均保持固定同源资源，页面查询不能污染导入。
   })
   assert.equal(record.id, '@adminsmart/dsh-shared-settings')
   const wrapperModule = record.factory(name => { assert.equal(name, 'react/jsx-runtime'); return require(name) }) // 使用实际React平台实例。
@@ -139,18 +182,18 @@ test('正式wrapper先script登记真实ModuleSystem，未知导入pending时仍
     assert.equal(facade.describe().getSnapshot().view.namespaces.find(row => row.ns === 'ui-settings').extra, undefined)
     const feedback = registrations.get('adminsmart-shared-policy-status') // 产品实际错误反馈席位。
     assert.ok(feedback)
-    const status = feedback.options.inject().hooks.policyStatus // 官方renderer消费的真实稳定Observable。
+    const { policyStatusGeneral, policyStatusNative } = feedback.options.inject().hooks // 两个真实公开Observable分别负责General和Native/mixed region反馈。
     writeStatus = 503
     await assert.rejects(() => facade.get('ui-theme').set('fontSize', 18), /保存失败/u)
-    let rendered = feedback.component({ usePolicyStatus: selector => selector(status.getSnapshot()) }) // 读取正式组件输出而非仅检查内部error字段。
+    let rendered = feedback.component({ usePolicyStatusGeneral: selector => selector(policyStatusGeneral.getSnapshot()), usePolicyStatusNative: selector => selector(policyStatusNative.getSnapshot()) }) // 读取正式组件输出而非仅检查内部error字段。
     assert.equal(rendered.props.role, 'alert')
     assert.match(rendered.props.children, /保存失败/u)
     writeStatus = 200
     delivery = 'delayed'
     assert.equal(await facade.get('ui-theme').set('fontSize', 20), true)
     assert.equal(policy.settings.fontSize, 20)
-    assert.equal(status.getSnapshot().error, null)
-    rendered = feedback.component({ usePolicyStatus: selector => selector(status.getSnapshot()) })
+    assert.equal(policyStatusNative.getSnapshot().error, null)
+    rendered = feedback.component({ usePolicyStatusGeneral: selector => selector(policyStatusGeneral.getSnapshot()), usePolicyStatusNative: selector => selector(policyStatusNative.getSnapshot()) })
     assert.equal(rendered.props.role, 'status')
     assert.equal(rendered.props.children, '设置已保存，实时同步暂不可用')
     assert.equal(puts, 2)

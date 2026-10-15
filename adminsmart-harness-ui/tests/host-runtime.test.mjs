@@ -1,11 +1,9 @@
 /** Verify the Host plugin exposes only browser-safe routes and no Harness Workspace capability. */
 
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { readFile, stat } from 'node:fs/promises'
 
-import { installRuntimeRoleIndexInjection, readSessionWebAccessState, updateSessionWebAccessState } from '../src/index.mjs'
+import { inject as hostInject, installRuntimeRoleIndexInjection } from '../src/index.mjs'
 
 for (const isAdmin of [true, false]) {
   let listener // 隔离捕获官方 Index Injection 回调，不启动网络服务。
@@ -20,17 +18,15 @@ for (const isAdmin of [true, false]) {
   assert.deepEqual(table, [{ kind: 'global', name: '__ADMINSMART_RUNTIME_ROLE__', value: isAdmin ? 'admin' : 'managed-user' }])
 }
 
-const logoPath = new URL('../assets/aurasearch-logo.jpg', import.meta.url) // Repository-owned product artwork served by the Host plugin.
+const logoPath = new URL('../assets/aurasearch-logo.webp', import.meta.url) // Repository-owned product artwork served by the Host plugin.
 const logoMetadata = await stat(logoPath) // Binary asset must remain present for every Runtime activation.
 const hostSource = await readFile(new URL('../src/index.mjs', import.meta.url), 'utf8') // Source-level contract check avoids starting a real web server.
+const workspaceSource = await readFile(new URL('../src/managed-workspace.mjs', import.meta.url), 'utf8') // 受管目录业务归独立模块，静态边界检查不读取用户登记。
 
 assert.ok(logoMetadata.size > 1024, 'AuraSearch logo asset must be non-empty')
-assert.match(hostSource, /export const inject = \['workspaceRegistry', 'sessionPersistence', 'sessions', 'webServer', 'messageFeedback', 'configEditor', 'credentials', 'settings', 'llm'\]/)
+for (const dependency of ['workspaceRegistry', 'sessionPersistence', 'sessions', 'webServer', 'messageFeedback', 'configEditor', 'credentials', 'settings', 'llm', 'agentDefaultModel', 'agents', 'attachments', 'fileUploads', 'fs', 'sessionProjections', 'sessionQuery', 'typert']) assert.equal(hostInject.includes(dependency), true) // 真正业务依赖门禁不能被源码格式或旧静态行掩盖。
 assert.doesNotMatch(hostSource, /SESSION_SEARCH_ROUTE|ctx\.sessionQuery|sessionSearchSnippet/, '会话搜索只由官方工作区实现')
-assert.match(hostSource, /AURASEARCH_LOGO_ROUTE = '\/adminsmart\/assets\/aurasearch-logo\.jpg'/)
-assert.match(hostSource, /SESSION_WEB_ACCESS_ROUTE = '\/adminsmart\/sessions\/web-access'/)
-assert.match(hostSource, /harnessRequire\.resolve\('@deepseek-ai\/dsh-atomic-write'\)/)
-assert.match(hostSource, /ctx\.sessions\.get\(sessionId\)/)
+assert.match(hostSource, /AURASEARCH_LOGO_ROUTE = '\/adminsmart\/assets\/aurasearch-logo\.webp'/)
 assert.doesNotMatch(hostSource, /ctx\.sessions\.binding/)
 assert.doesNotMatch(hostSource, /knowledge\/scope|requestKnowledgeScope/)
 assert.match(hostSource, /installFeedbackRoute\(ctx/, '原生管理反馈只通过受限 Host 路由读取')
@@ -39,39 +35,13 @@ assert.match(hostSource, /apiBase: requiredEnvironment\('ADMINSMART_AGENT_API_BA
 assert.match(hostSource, /capabilityTokenPath: requiredEnvironment\('ADMINSMART_AGENT_TOKEN_FILE'\)/, '内部读取必须使用受管能力证明，不能以浏览器 Cookie 代替 admin 授权')
 assert.match(hostSource, /class AdminSmartCancelledDirectoryPicker extends DirectoryPicker/)
 assert.match(hostSource, /return null \/\/ Every directory request behaves like an operator cancellation/)
-assert.match(hostSource, /ensureInternalRuntimeWorkspace\(ctx, runtimeCwd\)/)
-assert.match(hostSource, /INTERNAL_RUNTIME_WORKSPACE_TITLE = '知识库工作区'/)
+assert.match(hostSource, /installManagedWorkspace\(ctx, \{ runtimeCwd \}\)/)
+assert.doesNotMatch(hostSource, /ensureInternalRuntimeWorkspace|runtimeSessionHeaders|\breadFile, realpath\b/)
+assert.match(workspaceSource, /registry\.create\(canonical, retainedTitle\)/)
+assert.match(workspaceSource, /snapshot\?\.header/)
+assert.doesNotMatch(hostSource, /workspace\.setTitle|INTERNAL_RUNTIME_WORKSPACE_TITLE|ADMIN_MODELS_ROUTE|ADMIN_MODELS_DISCOVER_ROUTE|MODEL_REASONING_ROUTE|MODEL_DEFAULTS_ROUTE|MODEL_CONFIGURATION_ROUTE|PRIVATE_MODEL_REASONING_ROUTE/)
 assert.doesNotMatch(hostSource, /FIXED_WORKSPACE_TITLE|WORKSPACE_REPAIR_INTERVAL_MS|sessionFilters: \[{ kind: 'cwd'/)
 
-const temporaryRoot = await mkdtemp(join(tmpdir(), 'adminsmart-session-web-access-')) // 当前测试独占且结束时完整清理的 Runtime 状态根。
-const statePath = join(temporaryRoot, '.adminsmart-state', 'session-web-access.json') // 与生产相同的固定文件布局。
-const passthroughLock = async (_path, operation) => operation() // 单进程测试替身只验证锁内读改写语义。
-const localAtomicWrite = async (path, content) => { await writeFile(path, content, { encoding: 'utf8' }) } // 临时目录内的原子写接口替身。
-try {
-  const initialState = await readSessionWebAccessState(statePath) // 不存在的状态文件必须按产品默认开启解释。
-  assert.deepEqual(initialState, { version: 1, sessions: {} })
-  const savedEnabled = await updateSessionWebAccessState({
-    statePath, // 当前测试状态文件。
-    sessionId: 'session-a', // 当前用户 Runtime 内的一个普通 Session 身份。
-    enabled: false, // 用户明确关闭联网。
-    withFileLock: passthroughLock, // 与生产签名相同的测试写锁。
-    writeFileAtomic: localAtomicWrite, // 与生产签名相同的测试写入器。
-  })
-  assert.equal(savedEnabled, false)
-  const savedState = await readSessionWebAccessState(statePath) // 关闭选择必须持久保留到下一次页面加载。
-  assert.equal(savedState.sessions['session-a'].enabled, false)
-  await writeFile(statePath, '{broken', 'utf8') // 模拟异常退出留下的不可解析旧状态。
-  const repairedEnabled = await updateSessionWebAccessState({
-    statePath, // 复用同一损坏状态文件。
-    sessionId: 'session-a', // 当前用户仍在操作的原 Session。
-    enabled: true, // 明确点击开启应修复状态而不是永久卡死。
-    withFileLock: passthroughLock,
-    writeFileAtomic: localAtomicWrite,
-  })
-  assert.equal(repairedEnabled, true)
-  assert.equal((await readSessionWebAccessState(statePath)).sessions['session-a'].enabled, true)
-} finally {
-  await rm(temporaryRoot, { recursive: true, force: true })
-}
+assert.doesNotMatch(hostSource, /SESSION_WEB_ACCESS|session-web-access\.json|readSessionWebAccessState|updateSessionWebAccessState/, 'Host 不再保存会话联网开关或装载退役路由')
 
 process.stdout.write('host_runtime_contract=ok\n')

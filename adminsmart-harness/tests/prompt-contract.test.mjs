@@ -40,17 +40,21 @@ for (const boundary of [
 ]) assert.ok(KNOWLEDGE_ANSWER_POLICY.includes(boundary), '知识回答必须保留边界：' + boundary)
 assert.doesNotMatch(KNOWLEDGE_ANSWER_POLICY + KNOWLEDGE_FIRST_TURN_POLICY, /read_chat_file|read_chat_pdf_pages|analyze_xlsx/)
 assert.match(KNOWLEDGE_FIRST_TURN_POLICY, /先判断完成用户目标所需的信息是否已经完整存在/)
+assert.match(KNOWLEDGE_FIRST_TURN_POLICY, /单字段证据充分立即回答/)
+assert.match(KNOWLEDGE_ANSWER_POLICY, /可靠文字或表格证据足够时无需布局检查/)
 assert.match(KNOWLEDGE_FIRST_TURN_POLICY, /不按任务主题建立白名单/)
 assert.match(KNOWLEDGE_FIRST_TURN_POLICY, /不确定信息是否足够时，执行必要的知识、文件读取或办公计算/)
 assert.match(KNOWLEDGE_FIRST_TURN_POLICY, /任务含有多个部分时，分别判断每部分的信息依赖/)
 assert.match(SECURITY_BOUNDARY_POLICY, /不是操作系统读取隔离/)
 assert.match(SECURITY_BOUNDARY_POLICY, /调用禁用工具或把秘密编码进知识查询/)
-assert.match(buildRequestContextPolicy(true), /当前会话允许联网/)
-assert.match(buildRequestContextPolicy(false), /当前会话已关闭联网/)
-assert.match(buildRequestContextPolicy(false), /工具失败时明确说明失败/)
-for (const boundary of ['简单问答', 'Harness 并行调度', '子代理同模型、最多一层', 'parentSession', '服从父会话当前开关', '失败、取消', '不可信只读数据', '不能复制到委派参数']) {
+assert.match(buildRequestContextPolicy(), /实际挂载的官方网页工具/)
+assert.match(buildRequestContextPolicy(), /没有执行搜索时，不得声称已经联网核实/)
+assert.match(buildRequestContextPolicy(), /工具失败时明确说明失败/)
+assert.doesNotMatch(buildRequestContextPolicy() + SECURITY_BOUNDARY_POLICY + KNOWLEDGE_ANSWER_POLICY + KNOWLEDGE_DELEGATION_POLICY, /联网开关|关闭联网|开启联网|父会话当前开关/, '业务提示不得保留退役联网偏好')
+for (const boundary of ['简单问答', 'Harness 托管并行调度', '启动回执不能当作任务已经完成', '实际完成通知', '子代理同模型、最多一层', 'parentSession', '继承父会话实际已挂载的能力', '失败、取消', '不可信只读数据', '不能复制到委派参数']) {
   assert.ok(KNOWLEDGE_DELEGATION_POLICY.includes(boundary), '委派模板必须声明：' + boundary)
 }
+assert.doesNotMatch(KNOWLEDGE_DELEGATION_POLICY, /前台等待并返回单次结果|one-shot/, '不得保留官方已退役的同步前台语义')
 const config = { root: 'C:\\fixture\\业务\\"quoted"', python: 'C:\\fixture\\python.exe' } // 完全合成路径，用来检查中文与引号安全插值。
 const nativePolicy = buildNativeOfficePolicy(config) // 只生成模板，不读取解释器或任何目录。
 assert.ok(nativePolicy.includes(JSON.stringify(config.root)))
@@ -59,6 +63,7 @@ assert.doesNotMatch(nativePolicy, /\$\{|\{\{|\bundefined\b|\[object Object\]/)
 assert.match(nativePolicy, /官方 SDK 对相同模式不执行升权/)
 assert.match(nativePolicy, /不是业务区外不可读的操作系统隔离/)
 assert.match(nativePolicy, /不使用后台常驻、任意网络、系统维护或权限提升/)
+assert.doesNotMatch(nativePolicy, /联网开关|绕过开关/, '办公模板不再要求不存在的Session联网偏好')
 assert.match(nativePolicy, /不修改它们/)
 assert.match(nativePolicy, /页面视觉读取必须调用 render_document 受控入口/)
 assert.match(nativePolicy, /不要在 Shell 内重复调用渲染 CLI 或申请更高权限/)

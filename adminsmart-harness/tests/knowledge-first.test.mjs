@@ -56,11 +56,13 @@ assert.throws(() => releasedV4SessionFormatCodec.encodeEvent({
   type: 'user/message', seq: 1, time: 1,
   data: { ...notice, source: { kind: 'plugin', plugin: name } },
 }), /format v4 message requires a producer-owned source kind/)
-assert.match(notice.content[0].text, /先取得本轮证据/)
-assert.match(notice.content[0].text, /需要完整知识原件使用 load_knowledge_files/)
-assert.match(notice.content[0].text, /Excel 精确统计使用已配置解释器真实计算/)
+assert.match(notice.content[0].text, /先取得必要证据/)
+assert.match(notice.content[0].text, /selected 相关原件/)
+assert.match(notice.content[0].text, /单字段证据充分立即回答/)
 assert.match(notice.content[0].text, /不按任务主题建立白名单/)
 assert.doesNotMatch(notice.content[0].text, /read_chat_file|read_chat_pdf_pages|analyze_xlsx/)
+assert.match(notice.content[0].text, /不默认 all、写脚本或布局渲染/)
+assert.match(notice.content[0].text, /失败、未读或片段未命中不等于知识库没有资料/)
 
 const laterStep = await preStep({
   messages: [userMessage], // 后续步骤即使带有工具结果或续写消息也不能重复注入。

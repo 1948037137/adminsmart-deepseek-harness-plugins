@@ -1,6 +1,6 @@
 {
   "name": "@adminsmart/dsh-client-ui",
-  "description": "AdminSmart 官方 Harness 界面适配：保留 Workspace、Session、Header、Settings 和 Plugins，只补产品品牌与知识业务控件。",
+  "description": "AdminSmart 业务与官方 Harness 接线：可信身份、共享配置持久化、模型池、审计、会话联网与业务 Logo，界面和引擎使用官方实现。",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -10,7 +10,9 @@
     "./client": "./lib/client.js",
     "./shared-settings": "./shared-settings/index.mjs",
     "./shared-settings/client": "./shared-settings/client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./official-remotes": "./official-remotes/index.mjs",
+    "./official-remotes/client": "./official-remotes/client.js"
   },
   "dsh": {
     "client": {
@@ -30,6 +32,6 @@
     }
   },
   "scripts": {
-    "check": "node --check src/index.mjs && node --check src/ui-policy-client.mjs && node --check src/shared-settings.mjs && node --check shared-settings/index.mjs && node --check shared-settings/client.js && node --check src/admin-models.mjs && node --check src/feedback.mjs && node --check src/model-provider.mjs && node --check src/read-only-settings.mjs && node --check src/shared-ui-policy.mjs && node --check src/workspace-view.mjs && node --check lib/client.js && node tests/client-bundle.test.mjs && node --test tests/ui-policy-client-fake.mjs tests/shared-settings-sdk-contract.test.mjs && node --experimental-vm-modules --test tests/shared-settings-wrapper.test.mjs && node --test tests/admin-models.test.mjs tests/client-slot-registration.test.mjs tests/feedback-read.test.mjs tests/feedback-sync.test.mjs tests/model-preference-state.test.mjs tests/model-provider.test.mjs tests/workspace-view.test.mjs tests/shared-ui-policy-sync.test.mjs && node tests/web-access-client.test.mjs && node tests/host-runtime.test.mjs && node tests/host-http.test.mjs"
+    "check": "node --check official-remotes/index.mjs && node --check official-remotes/client.js && node --check src/personal-theme-http.mjs && node --check src/index.mjs && node --check src/policy-bootstrap-host.mjs && node --check src/managed-workspace.mjs && node --check src/native-policy-host.mjs && node --check src/native-policy-client.mjs && node --check src/managed-model-sync.mjs && node --check src/guarded-plugin-manager.mjs && node --check src/ui-policy-client.mjs && node --check src/shared-settings.mjs && node --check shared-settings/index.mjs && node --check shared-settings/client.js && node --check src/guarded-settings-controller.mjs && node --check src/feedback.mjs && node --check src/model-provider.mjs && node --check src/read-only-settings.mjs && node --check src/shared-ui-policy.mjs && node --check lib/client.js && node tests/client-bundle.test.mjs && node --test tests/index-sdk-assembly.test.mjs tests/official-remotes-host.test.mjs tests/workspace-boot-manifest-sdk.test.mjs tests/managed-workspace-sdk.test.mjs tests/guarded-plugin-manager-sdk.test.mjs tests/official-plugin-management-sdk.test.mjs tests/auto-review-lifecycle-sdk.test.mjs tests/managed-model-sync-sdk.test.mjs tests/native-policy.test.mjs tests/policy-bootstrap-host.test.mjs tests/policy-bootstrap-client.test.mjs tests/policy-adopt-noop-sdk.test.mjs tests/native-policy-original-sdk.test.mjs tests/brand-original-sdk.test.mjs tests/shared-events.test.mjs && node --test tests/model-startup.test.mjs tests/workspace-view-client.test.mjs tests/chrome-scope.test.mjs tests/native-models-sdk.test.mjs tests/guarded-settings-sdk.test.mjs && node --test tests/ui-policy-client-fake.mjs tests/shared-settings-sdk-contract.test.mjs && node --experimental-vm-modules --test tests/shared-settings-wrapper.test.mjs tests/shared-settings-native-wrapper.test.mjs && node --test tests/client-slot-registration.test.mjs tests/feedback-read.test.mjs tests/feedback-sync.test.mjs tests/model-provider.test.mjs tests/shared-ui-policy-sync.test.mjs && node --test tests/personal-theme.test.mjs tests/personal-theme-bridge.test.mjs tests/mobile-logout-client.test.mjs tests/hero-presentation-client.test.mjs tests/web-access-client.test.mjs && node tests/host-runtime.test.mjs && node tests/host-http.test.mjs"
   }
 }

@@ -19,26 +19,27 @@ export const inject = [
   'fs', // 官方文件工具和工作目录使用同一个公开文件系统。
   'sandboxPolicy', // 原生命令必须保留官方 workspace-write 状态。
   'web', // Search and fetch providers use separate official Web capability registrations.
-  'subagents', // 原生前台委派使用 Host 注册的官方同进程 provider。
+  'subagents', // 原生托管激活使用 Host 注册的官方同进程 provider与完成通知。
   'sessionProjections', // 官方子代理 Tool 的会话投影注册依赖。
   'agents', // 复核子代理真实运行时所有权，不能只相信持久父会话 ID。
-  'sessions', // 父附件和联网权限只沿 live 官方 Session 关系继承。
+  'sessions', // 父附件和实际工具范围只沿 live 官方 Session 关系继承。
 ]
 
 /**
  * Mount every cohesive AuraSearch capability in one Agent Preset context.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx - Agent-scoped Cordis context supplied by the AuraSearch Preset.
- * @returns {void} All Tool, Guard, and prompt contributions are registered synchronously in the same scope layer.
+ * @returns {Promise<void>} 同一业务作用域的全部工具、Guard与提示词装配完成后兑现；官方异步初始化失败由Loader接收。
+ * @throws {Error} 业务依赖或官方委派初始化失败，所属Cordis fiber负责释放已登记资源。
  */
-export function apply(ctx) {
+export async function apply(ctx) {
   applyLightRagTool(ctx)
   applyAnySearchProvider(ctx)
   applyPublicWebFetchProvider(ctx)
   applyBusinessRegistryTool(ctx)
   applyKnowledgeAttachments(ctx)
   applyDocumentRender(ctx)
-  applyKnowledgeDelegation(ctx)
+  await applyKnowledgeDelegation(ctx)
   applySecurity(ctx)
   applyKnowledgeFirst(ctx)
   applyKnowledgePolicy(ctx)

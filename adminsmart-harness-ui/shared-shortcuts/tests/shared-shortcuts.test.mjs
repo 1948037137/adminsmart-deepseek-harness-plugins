@@ -1,18 +1,19 @@
-/** 使用当前固定alpha.1公开protocol和内存Fake存储验证桥，不启动浏览器/网络或触碰用户数据。 */
+/** 使用当前固定 alpha.2 公开 protocol 和内存 Fake 存储验证桥，不启动浏览器/网络或触碰用户数据。 */
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
 import { installSharedShortcutsClient, mergeShortcutChanges } from '../src/shared-shortcuts-client.mjs'
-import { installShortcutPolicyHttp, requestShortcutPolicy, validateShortcutDocument } from '../src/shortcut-policy-http.mjs'
+import { installShortcutPolicyHttp, requestShortcutPolicy, validateShortcutDocument, SHORTCUT_POLICY_CLIENT_ROUTE, SHORTCUT_POLICY_CLIENT_REVISION_GLOBAL, SHORTCUT_POLICY_ROUTE } from '../src/shortcut-policy-http.mjs'
 
 const runtimeRoot = path.resolve(process.env.ADMINSMART_DSH_ROOT || fileURLToPath(new URL('../../../../deepseek-harness-runtime/', import.meta.url))) // 与受管Runtime同一固定安装，路径相对项目或可信测试环境。
 const harnessRequire = createRequire(pathToFileURL(path.join(runtimeRoot, 'package.json'))) // 仅作为官方公开包解析锚点。
-const protocol = await import(pathToFileURL(harnessRequire.resolve('@deepseek-ai/dsh-client-shortcuts/protocol')).href) // 原样加载真实alpha.1纯协议，不复制或截取第三方源码。
+const protocol = await import(pathToFileURL(harnessRequire.resolve('@deepseek-ai/dsh-client-shortcuts/protocol')).href) // 原样加载真实 alpha.2 纯协议，不复制或截取第三方源码。
 const PROFILE = 'web:windows' // 测试设备固定，不从真实navigator或localStorage推断。
 const binding = code => ({ code, modifiers: ['control', 'alt'] }) // 合法Windows Web组合，code是用例明确指定的物理键。
 const clone = value => JSON.parse(JSON.stringify(value)) // 只复制合成JSON偏好。
@@ -96,7 +97,7 @@ function serverFixture(envelope) {
 const bridgeFixture = (shortcuts, server, options = {}) => installSharedShortcutsClient({ shortcuts, fetchImpl: server.fetch, events: false, schedule: noTimer, cancelSchedule() {}, ...options })
 
 test('官方protocol接受受控偏好，拒绝固定、任意动作、平台违规和显式冲突', () => {
-  assert.equal(harnessRequire('@deepseek-ai/dsh-client-shortcuts/package.json').version, '0.2.1-alpha.1')
+  assert.equal(harnessRequire('@deepseek-ai/dsh-client-shortcuts/package.json').version, '0.2.1-alpha.3')
   assert.deepEqual(validateShortcutDocument(document({ 'session.new': binding('KeyJ'), 'page.refresh': null }), protocol), document({ 'session.new': binding('KeyJ'), 'page.refresh': null }))
   for (const overrides of [
     { 'response.stop': null }, // 固定停止动作虽无fixed前缀仍不得编辑。
@@ -383,4 +384,136 @@ test('Host拒绝超限回环响应，读取期间停止，不向浏览器转发�
   const options = { apiBase: 'http://127.0.0.1:9098', readToken: async () => 'fixture-capability', userId: '7', modeId: 'knowledge', presetId: 'adminsmart-knowledge', isAdmin: false } // 合成只读Runtime。
   const helpers = { protocol, fetchImpl: async () => new Response('X'.repeat(32_769)) } // 明确超过受限JSON预算的合成响应。
   await assert.rejects(requestShortcutPolicy(options, 'GET', undefined, helpers), error => error.code === 'agent_shortcut_policy_unavailable')
+})
+
+/**
+ * 创建只使用公开HTTP/index-inject协议的离线Host，不监听端口或访问业务数据。
+ * @param {Buffer|undefined} source 已在Fixture启动前捕获的代码字节，undefined专测legacy兼容。
+ * @returns {object} 原路由、注入、固定Fixture偏好响应与释放入口。
+ */
+function moduleCacheFixture(source) {
+  const routes = new Map() // 原安装器实际注册的有限固定路由。
+  const listeners = new Set() // Host当前代码SHA的官方IndexInjection监听器。
+  const cleanups = [] // 每个effect返回的真实卸载回调。
+  let legacyReads = 0 // Snapshot优先时必须保持0，旧Fixture只走legacy路径。
+  const ctx = {
+    effect(callback) { cleanups.push(callback()) },
+    on(event, listener) { assert.equal(event, 'webserver/index-inject'); listeners.add(listener); return () => listeners.delete(listener) },
+    webServer: { register(route) { routes.set(route.path, route); return () => routes.delete(route.path) } },
+  } // 只代替HTTP载体和事件存储，不Fake原安装器处理器。
+  const options = { apiBase: 'http://127.0.0.1:9098', readToken: async () => 'fixture-capability', userId: '7', modeId: 'knowledge', presetId: 'adminsmart-knowledge', isAdmin: false } // 全部合成可信上下文。
+  installShortcutPolicyHttp(ctx, options, {
+    assertSameOrigin() {}, // 当前所有合成请求使用同源。
+    readJsonBody: async () => ({}), // 本组只验证代码GET/HEAD与偏好GET，没有写入请求。
+    ...(source === undefined ? {} : { clientModuleSource: source }), // 严格区分真实启动快照与旧Fixture缺字段。
+    readClientModule: async () => { legacyReads += 1; return 'export const legacyFixture = true\n' }, // 不读取实际文件或用户数据。
+    protocol, // 完整原始alpha.2公开快捷键协议。
+    fetchImpl: async () => Response.json({ revision: 1, document: document({}) }), // 固定偏好接口的合成返回。
+  })
+  return {
+    routes,
+    get legacyReads() { return legacyReads },
+    injections() { const table = []; for (const listener of listeners) listener(table); return table },
+    async request(path, { method = 'GET', query = '' } = {}) {
+      const response = { status: undefined, headers: undefined, body: undefined } // 原处理器通过标准Node响应接口填充。
+      await routes.get(path).handler({ method, url: path + query, headers: {} }, { writeHead(status, headers) { response.status = status; response.headers = headers }, end(body) { response.body = body } })
+      return response
+    },
+    dispose() { for (const cleanup of cleanups.reverse()) cleanup?.(); assert.equal(routes.size, 0); assert.equal(listeners.size, 0) },
+  }
+}
+
+test('启动codec快照SHA经官方index注入，正确版本GET/HEAD私有缓存且外部Buffer变化不能改变字节', async () => {
+  const source = Buffer.from('export const fixture = "合成"\n') // 固定UTF-8代码验证长度不能按字符数计算。
+  const expected = Buffer.from(source) // 记录根启动时的实体，之后故意改变调用方Buffer。
+  const revision = createHash('sha256').update(expected).digest('hex') // 预期只从代码字节计算，不混入策略或身份。
+  const f = moduleCacheFixture(source)
+  source.fill(88) // 调用方Buffer后续被覆盖，Host快照仍必须完整。
+  try {
+    assert.deepEqual(f.injections(), [{ kind: 'html', placement: 'head', html: '<link rel="modulepreload" crossorigin href=".' + SHORTCUT_POLICY_CLIENT_ROUTE + '?rev=' + revision + '">' }, { kind: 'global', name: SHORTCUT_POLICY_CLIENT_REVISION_GLOBAL, value: revision }]) // 初值只增加模块下载提示，不执行codec或预请求真实偏好。
+    const get = await f.request(SHORTCUT_POLICY_CLIENT_ROUTE, { query: '?rev=' + revision })
+    const head = await f.request(SHORTCUT_POLICY_CLIENT_ROUTE, { method: 'HEAD', query: '?rev=' + revision })
+    assert.equal(get.status, 200)
+    assert.equal(head.status, 200)
+    assert.equal(get.headers['cache-control'], 'private, max-age=31536000, immutable')
+    assert.deepEqual(head.headers, get.headers)
+    assert.equal(get.headers['content-length'], String(expected.byteLength))
+    assert.equal(get.headers['x-content-type-options'], 'nosniff')
+    assert.deepEqual(get.body, expected)
+    assert.equal(head.body, undefined)
+    assert.equal(f.legacyReads, 0)
+  } finally { f.dispose() }
+})
+
+test('codec无版本no-store，错空重复rev均410，真实shortcut policy即使带相同rev也始终no-store', async () => {
+  const source = Buffer.from('export const fixture = true\n') // 本组可缓存的合成代码实体。
+  const revision = createHash('sha256').update(source).digest('hex') // 仅可信静态代码修订。
+  const f = moduleCacheFixture(source)
+  try {
+    const legacy = await f.request(SHORTCUT_POLICY_CLIENT_ROUTE)
+    assert.equal(legacy.status, 200)
+    assert.equal(legacy.headers['cache-control'], 'no-store')
+    for (const query of ['?rev=', '?rev=wrong', '?rev=' + 'b'.repeat(64), '?rev=' + revision + '&rev=' + revision]) {
+      const result = await f.request(SHORTCUT_POLICY_CLIENT_ROUTE, { query }) // 参数只用于验证，不允许选择别的代码版本。
+      assert.equal(result.status, 410)
+      assert.equal(result.headers['cache-control'], 'no-store')
+      assert.equal(result.body, undefined)
+    }
+    const policy = await f.request(SHORTCUT_POLICY_ROUTE, { query: '?rev=' + revision })
+    assert.equal(policy.status, 200)
+    assert.equal(policy.headers['cache-control'], 'no-store')
+    assert.equal(JSON.parse(policy.body).revision, 1)
+    assert.equal(f.legacyReads, 0)
+  } finally { f.dispose() }
+})
+
+test('旧Fixture缺启动快照时不注入猜测版本，legacy回调只处理无rev路径', async () => {
+  const f = moduleCacheFixture() // 未部署新版根接线的Fixture不能拥有可信静态版本。
+  try {
+    assert.deepEqual(f.injections(), [])
+    const result = await f.request(SHORTCUT_POLICY_CLIENT_ROUTE)
+    assert.equal(result.status, 200)
+    assert.equal(result.headers['cache-control'], 'no-store')
+    assert.equal(f.legacyReads, 1)
+    const rejected = await f.request(SHORTCUT_POLICY_CLIENT_ROUTE, { query: '?rev=' + 'a'.repeat(64) })
+    assert.equal(rejected.status, 410)
+    assert.equal(f.legacyReads, 1)
+  } finally { f.dispose() }
+})
+
+test('原consumer动态import仅采用有效Host SHA，页面rev和无效global不能改变固定同源资源', () => {
+  const consumerPath = fileURLToPath(new URL('../lib/client.js', import.meta.url)) // 当前真正自有consumer完整字节。
+  const script = `
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const cases = JSON.parse(process.argv[2]);
+const results = [];
+for (const choice of cases) {
+ let declaration;
+ let activate;
+ let cleanup;
+ const ready = new Promise(resolve => { activate = resolve; });
+ const requests = [];
+ const codec = 'data:text/javascript,' + encodeURIComponent('export function installSharedShortcutsClient({shortcuts}) { shortcuts.activate(); return { dispose() { shortcuts.dispose(); } }; }');
+ const window = { location: { href: 'http://fixture.test/runtime/?rev=untrusted-page-query' }, __ModuleLoader__: { load(value) { declaration = value; } } };
+ if (choice.revision !== null) window.__ADMINSMART_SHARED_SHORTCUTS_CLIENT_REVISION__ = choice.revision;
+ vm.runInNewContext(fs.readFileSync(process.argv[1], 'utf8'), { window, URL }, { importModuleDynamically(specifier) { requests.push(specifier); return import(codec); } });
+ let disposed = 0;
+ declaration.factory().apply({ shortcuts: { activate, dispose() { disposed += 1; } }, effect(register) { cleanup = register(); } });
+ let timer;
+ await Promise.race([ready, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('consumer import did not complete')), 1000); })]);
+ clearTimeout(timer);
+ const expected = 'http://fixture.test/runtime/adminsmart/shared-shortcuts-client.mjs' + (choice.versioned ? '?rev=' + choice.revision : '');
+ assert.deepEqual(requests, [expected]);
+ cleanup();
+ assert.equal(disposed, 1);
+ results.push({ versioned: choice.versioned, fixedResource: true, disposed });
+}
+process.stdout.write(JSON.stringify(results));
+` // 子进程只使用合成window与内存codec，不启动浏览器、不加载真实外部URL。
+  const choices = [{ revision: 'a'.repeat(64), versioned: true }, { revision: null, versioned: false }, { revision: 'invalid', versioned: false }, { revision: 'A'.repeat(64), versioned: false }] // 字符串类型和64位小写SHA完全验证，地址栏永不作为fallback。
+  const result = spawnSync(process.execPath, ['--experimental-vm-modules', '--input-type=module', '-e', script, consumerPath, JSON.stringify(choices)], { encoding: 'utf8', timeout: 10_000 }) // 参数数组直接传递，不使用shell插值。
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(JSON.parse(result.stdout), choices.map(choice => ({ versioned: choice.versioned, fixedResource: true, disposed: 1 })))
 })

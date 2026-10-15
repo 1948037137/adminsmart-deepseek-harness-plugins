@@ -1,7 +1,9 @@
 /** 仅转发八项 General 设置的同源 Host 桥；身份、角色与能力令牌只由服务端提供。 */
+import { createHash } from 'node:crypto'
 
 export const UI_POLICY_ROUTE = '/adminsmart/ui-policy' // 当前签名用户 Runtime 的有限 GET/PUT 入口。
 export const UI_POLICY_CLIENT_ROUTE = '/adminsmart/ui-policy-client.mjs' // 自有纯浏览器模块的固定资源入口。
+export const UI_POLICY_CLIENT_REVISION_GLOBAL = '__ADMINSMART_UI_POLICY_CLIENT_REVISION__' // 官方页面初始化只公开固定代码哈希，不混入共享策略或用户状态。
 const POLICY_FIELDS = Object.freeze(['locale', 'theme', 'fontSize', 'transcriptView', 'performanceUsage', 'busyEnter', 'linkOpening', 'developerTools']) // 唯一允许过桥的八个 General 字段。
 const TRANSCRIPT_VALUES = new Set(['compact', 'standard', 'detailed', 'verbose', 'normal', 'expanded', null]) // RC2 当前、旧值和未指定模式，不接受显示文案。
 const MAXIMUM_BODY_BYTES = 4_096 // 八项展示设置请求的资源上限，禁止无界 Profile 文档。
@@ -110,16 +112,28 @@ export async function requestUiPolicy(options, method, body) {
 
 /**
  * 注册仅供当前签名 Runtime 使用的有限桥及自有浏览器资源。
- * @param {object} ctx 官方 Host Context，只使用 effect/webServer.register。
+ * @param {object} ctx 官方 Host Context，只使用 effect/on/webServer.register。
  * @param {object} options 与原 Host 策略同步共用的可信 options，不包含浏览器输入。
- * @param {object} helpers 同源验证、有界 JSON 读取和固定自有资源读取能力。
+ * @param {object} helpers 同源验证、有界 JSON 读取和固定自有资源快照。
  * @param {(request: object) => void} helpers.assertSameOrigin 校验 Gateway 转发后的同源浏览器请求。
  * @param {(request: object, maximumBytes: number) => Promise<object>} helpers.readJsonBody 有界 JSON 解析。
- * @param {() => Promise<string>} helpers.readClientModule 只读取本插件固定 JS 文件，不能由 URL 决定路径。
+ * @param {string|Buffer} helpers.clientModuleSource Host 启动时读取的固定纯 JS 字节，不含策略、身份或凭据；浏览器输入不能选择文件路径。
  * @returns {void} Cordis effect 管理路由卸载。
  * @remarks 浏览器 Cookie 由既有 Gateway 验签和绑定 Runtime，插件不读取或转发 Cookie；PUT 后端仍再次验证管理员能力。
  */
 export function installUiPolicyHttp(ctx, options, helpers) {
+  const clientModuleSource = Buffer.from(helpers.clientModuleSource) // 复制当前代码快照，避免外部 Buffer 变更使缓存哈希与实体字节不一致。
+  const clientModuleRevision = createHash('sha256').update(clientModuleSource).digest('hex') // 仅由同一固定代码快照计算可信版本身份。
+  ctx.effect(() => ctx.on('webserver/index-inject', table => {
+    const preload = '<link rel="modulepreload" crossorigin href=".' + UI_POLICY_CLIENT_ROUTE + '?rev=' + clientModuleRevision + '">' // 模块预载仅获取当前代码并保留同源凭据，与动态import使用相同URL；不执行模块或读取General政策。
+    if (!table.some(row => row.kind === 'html' && row.html === preload))
+      table.unshift({ kind: 'html', placement: 'head', html: preload }) // 官方公开IndexInjection没有modulepreload专用行，使用其标准HTML行，不改Loader或官方应用合并包。
+    table.push({
+      kind: 'global', // 原生页面在 Client 激活前注入公开静态版本。
+      name: UI_POLICY_CLIENT_REVISION_GLOBAL, // Wrapper 只据此选择同源固定模块版本。
+      value: clientModuleRevision, // 不含配置、Runtime 身份、Token 或动态响应。
+    })
+  }), 'adminsmart-client-ui: trusted General module revision')
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', // 不匹配任意子路径或服务器文件。
     path: UI_POLICY_ROUTE, // 固定的同源八项设置入口。
@@ -162,9 +176,19 @@ export function installUiPolicyHttp(ctx, options, helpers) {
         return
       }
       try {
-        const source = await helpers.readClientModule() // 唯一固定自有文件，不读第三方构建文件。
-        response.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' })
-        response.end(request.method === 'HEAD' ? undefined : source)
+        const revisions = new URL(request.url || UI_POLICY_CLIENT_ROUTE, 'http://runtime.invalid').searchParams.getAll('rev') // 查询只验证当前快照身份，不能改变资源路径或提供身份。
+        if (revisions.length > 1 || revisions.length === 1 && revisions[0] !== clientModuleRevision) {
+          response.writeHead(410, { 'cache-control': 'no-store' })
+          response.end()
+          return
+        }
+        response.writeHead(200, {
+          'content-type': 'text/javascript; charset=utf-8', // 只返回固定自有纯模块的原字节。
+          'cache-control': revisions.length === 1 ? 'private, max-age=31536000, immutable' : 'no-store', // 可信版本可在当前浏览器缓存，旧入口仍每次读取。
+          'content-length': String(clientModuleSource.byteLength), // HEAD 与 GET 描述同一完整编码实体。
+          'x-content-type-options': 'nosniff', // 不允许浏览器猜测其它内容类型。
+        })
+        response.end(request.method === 'HEAD' ? undefined : clientModuleSource)
       } catch {
         response.writeHead(503, { 'cache-control': 'no-store' })
         response.end()

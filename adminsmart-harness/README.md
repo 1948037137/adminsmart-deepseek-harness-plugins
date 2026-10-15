@@ -1,16 +1,16 @@
 # AdminSmart Harness 知识集成
 
-本目录只维护 AdminSmart 的业务权限与证据集成，不修改 Harness 上游源码。共享固定版为 0.2.1-alpha.1。
+本目录只维护 AdminSmart 的业务权限与证据集成，不修改 Harness 上游源码。共享固定版为 0.2.1-alpha.2。
 
 ## 保留的职责
 
 - index.mjs：同一 Agent Preset 作用域内组合业务工具、策略和安全 Guard。
-- security.mjs、native-file-policy.mjs：当前会话联网开关、原生文件路径、命令目录、原件只读、权限和后台模式检查。
+- security.mjs、native-file-policy.mjs：可信会话身份、原生文件路径、命令目录、原件只读、权限和后台模式检查。
 - session-files.mjs、session-authority.mjs：从官方已接受消息与原件桥接结果取得授权引用；子代理只继承可信直接父会话。
 - lightrag-tool.mjs：通过受管 FastAPI 调用当前用户知识检索，不直接访问数据库或 LightRAG 内部存储。
 - knowledge-attachments.mjs：当前用户与 Session 校验后，把知识原件流入官方 AttachmentStore；只桥接，不解析。
-- knowledge-delegation.mjs：复用官方前台单层子代理、父模型、原生并发和清理；不能扩大父权限。
-- anysearch-provider.mjs、public-web-fetch-provider.mjs、business-registry-tool.mjs：现有受控公开信息能力，服从父会话实时联网开关。
+- knowledge-delegation.mjs：复用官方单层子代理托管激活、启动回执、完成通知、父模型、并发和清理；不能扩大父权限，启动回执不等于任务完成。
+- anysearch-provider.mjs、public-web-fetch-provider.mjs、business-registry-tool.mjs：现有受控公开信息能力；网页工具使用官方实现，父子会话继承实际工具范围，不维护私有联网开关。
 - prompts/：证据、原生办公、身份、不可信文档和失败行为的独立模板。
 - document-render.mjs、document-render-policy.mjs：在当前 Session 文件授权下只调用固定官方 LibreOffice Kit renderImages，自动输出业务目录；不接受可执行代码、任意输出路径或升权，不自行解析/绘制。原生 read_image 与 present 继续负责看图和交付。
 

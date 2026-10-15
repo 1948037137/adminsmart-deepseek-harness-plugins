@@ -14,10 +14,11 @@ const { createConverter } = await loadRuntimeModule('@deepseek-ai/libreoffice-ki
 const RESULT_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
+    status: { type: 'string', enum: ['ready', 'skipped'], required: true }, // 与当前官方Office技能一致；只有ready且images非空才能进行视觉判断。
     fileName: { type: 'string', required: true }, // 本次实际渲染的原始文件显示名。
     pageCount: { type: 'integer', required: true }, // 官方返回的物理页、幻灯片或工作表总数，不代表全部已查看。
-    backend: { type: 'string', enum: ['native', 'wasm'], required: true }, // 官方实际选中的平台引擎，不静默换引擎。
-    rasterEngine: { type: 'string', enum: ['pdfium', 'libreoffice'], required: true }, // 页面像素的真实官方来源。
+    backend: { type: 'string', enum: ['native', 'wasm', 'unavailable'], required: true }, // skipped没有实际引擎时明确unavailable，不伪造渲染完成。
+    rasterEngine: { type: 'string', enum: ['pdfium', 'libreoffice', 'unavailable'], required: true }, // 只有ready时才对应实际页面像素来源。
     images: {
       type: 'array', required: true,
       items: {
@@ -37,6 +38,25 @@ const RESULT_SCHEMA = {
     note: { type: 'string', required: true }, // 明确已渲染选择范围及下一步真实看图要求。
   },
 } // 规范化输出，不传原件正文、内部引擎诊断或用户凭据。
+
+/**
+ * 明确结束未执行的视觉检查，不声称已经生成、查看或覆盖任何页面。
+ * @param {object} source 已验证的当前会话或业务目录输入。
+ * @param {string} note 固定业务限制文案，不包含服务器路径或底层异常。
+ * @returns {object} 符合官方Office技能ready/skipped判断的空产物结果。
+ */
+function skippedRenderResult(source, note) {
+  return {
+    status: 'skipped', // 模型必须结束本次视觉检查，不能把空图片当ready。
+    fileName: source.reference?.name ?? basename(source.path), // 只公开当前授权输入的显示名。
+    pageCount: 0, // 未调用引擎不能猜测物理页或工作表总数。
+    backend: 'unavailable', // 没有实际运行的引擎。
+    rasterEngine: 'unavailable', // 没有页面像素来源。
+    images: [], // 无可读取或可交付图像。
+    missingFonts: [], // 未运行渲染，不伪造字体诊断。
+    note, // 明确未核验范围与停止行为。
+  }
+}
 
 /**
  * 取得有界源字节快照；附件由官方 Store 完整性流读取，业务文件由官方 fs seam 读取。
@@ -118,6 +138,7 @@ export function createDocumentRenderer(converterFactory = createConverter) {
   return async (ctx, args, exec) => {
     let source // 执行时再次验证身份和路径，任何系统路径错误都转换成稳定拒绝。
     try { source = authorizedRenderSource(ctx, { ...exec, arguments: args }) } catch { throw new Error('页面渲染文件或参数未获当前业务会话授权') }
+    if (source.selection.skippedReason) return skippedRenderResult(source, source.selection.skippedReason) // 授权验证仍完成，但未明确表格范围时不读取字节、不启动引擎。
     if (active) throw new Error('当前正在渲染文件页面，请等待完成后重试')
     active = true
     const controller = new AbortController() // 将用户取消与独立期限都传给官方引擎及原件读取。
@@ -170,11 +191,11 @@ export function createDocumentRenderer(converterFactory = createConverter) {
       controller.signal.throwIfAborted()
       succeeded = true
       console.info('adminsmart_document_render ' + JSON.stringify({ outcome: 'success', images: images.length, elapsedMs: Date.now() - startedAt }))
-      return { fileName: source.reference?.name ?? basename(source.path), pageCount: result.pageCount, backend: result.backend, rasterEngine: result.rasterEngine, images, missingFonts: (result.missingFonts ?? []).slice(0, 32), note: '只渲染了返回的页面/区域。必须使用官方 read_image 实际看图；支持图片的当前模型才可作视觉判断。需要交付时使用原生 present，不把抽样说成全部页面。' }
+      return { status: 'ready', fileName: source.reference?.name ?? basename(source.path), pageCount: result.pageCount, backend: result.backend, rasterEngine: result.rasterEngine, images, missingFonts: (result.missingFonts ?? []).slice(0, 32), note: '只渲染了返回的页面/区域。必须使用官方 read_image 实际看图；支持图片的当前模型才可作视觉判断。需要交付时使用原生 present，不把抽样说成全部页面。' }
     } catch (error) {
-      console.info('adminsmart_document_render ' + JSON.stringify({ outcome: controller.signal.aborted ? 'cancelled-or-timeout' : 'failed', elapsedMs: Date.now() - startedAt }))
+      console.info('adminsmart_document_render ' + JSON.stringify({ outcome: controller.signal.aborted ? 'cancelled-or-timeout' : error.code === 'unavailable' ? 'skipped' : 'failed', elapsedMs: Date.now() - startedAt }))
       if (controller.signal.aborted) throw new Error(controller.signal.reason?.message ?? '文件页面渲染已取消')
-      if (error.code === 'unavailable') throw new Error('官方页面渲染引擎不可用，请管理员核对固定部署')
+      if (error.code === 'unavailable') return skippedRenderResult(source, '官方页面渲染引擎当前不可用，本次没有视觉核验。保留可用原件并明确此限制，不安装替代转换器或重复尝试另一条渲染管线。') // 官方技能据skipped结束视觉检查，不把缺引擎解释为可继续绕过限制。
       throw new Error('文件页面渲染失败：文件可能损坏、页码/区域无效、超过资源限制或官方引擎无法处理；未生成可交付页面')
     } finally {
       let cleanupFailed = false // 资源无法释放时不开放后续渲染槽，不泄漏底层异常诊断。
@@ -208,7 +229,7 @@ const renderDocument = createDocumentRenderer() // 生产唯一入口，父子�
 export function apply(ctx) {
   ctx.effect(() => ctx.tools.register(defineTool({
     name: DOCUMENT_RENDER_TOOL_NAME,
-    description: '使用官方 LibreOffice Kit 把当前会话附件或业务文件的指定 PDF/Office 页面、表格区域渲染成图片。只读原件，自动输出业务目录；默认第一页，每次最多三张。随后必须用官方 read_image 看图；表格精确计算仍用原生办公脚本。不能传命令、代码、输出路径或权限参数。',
+    description: '使用官方 LibreOffice Kit 把当前会话附件或业务文件的指定 PDF/Office 页面、表格区域渲染成图片。只读原件，自动输出业务目录；默认第一页，每次最多三张。仅status=ready时用官方read_image看图；status=skipped结束视觉检查并报告限制。表格须给实际sheet，精确计算使用原生办公工作流。不能传命令、代码、输出路径或权限参数。',
     parameters: {
       file_path: { type: 'string', required: true, description: '当前会话已授权附件路径或业务工作目录中的普通文档路径。' }, // 服务端重新校验授权和真实路径。
       pages: { type: 'array', items: { type: 'integer' }, description: 'PDF、Word 或演示文稿的一基物理页码，最多三个，不传时第一页。表格不使用此字段。' }, // 实际上限由纯选择校验与官方引擎共同实施。

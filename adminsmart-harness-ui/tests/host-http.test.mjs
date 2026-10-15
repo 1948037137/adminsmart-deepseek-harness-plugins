@@ -1,7 +1,8 @@
-/** 用真实本机 HTTP 验证 Host 开关与固定社区插件，不访问模型、数据库或用户文件。 */
+/** 用真实本机 HTTP 验证业务 Host 路由与退役入口，不访问模型、数据库或用户文件。 */
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -11,13 +12,19 @@ import { apply as applyHost } from '../src/index.mjs'
 const temporaryRoot = await mkdtemp(join(tmpdir(), 'adminsmart-host-http-')) // 全部文件与状态只属于当前隔离测试。
 const runtimeRoot = resolve(process.env.ADMINSMART_DSH_TEST_ROOT || resolve(import.meta.dirname, '../../..', 'deepseek-harness-runtime')) // 隔离版本兼容测试可覆盖安装树，用户 Runtime 不受影响。
 const runtimeRequire = createRequire(join(runtimeRoot, 'package.json')) // 防止从其它项目加载不同版本的插件。
+const { Context } = await import(pathToFileURL(runtimeRequire.resolve('@deepseek-ai/cordis')).href) // 新受管控制器仍在真实SDK子fiber中构造，HTTP传输与业务数据继续Fake。
+const { default: TypertRegistry } = await import(pathToFileURL(runtimeRequire.resolve('@deepseek-ai/dsh-typert-registry')).href) // 原控制器注册Remote所需公开协议服务，不发网络请求。
+const { default: RemoteAccess } = await import(pathToFileURL(runtimeRequire.resolve('@deepseek-ai/dsh-api-remote-access')).href) // alpha.3原Workspace/Session控制器要求真实方法级准入服务。
+const workspaceContext = new Context() // 独占的Workspace/Session控制器生命周期，不复用生产根。
 const oldHome = process.env.DSH_HOME // 测试结束恢复调用方的 Home 配置。
 const oldRuntimeRoot = process.env.ADMINSMART_DSH_ROOT // 测试结束恢复调用方的运行目录配置。
-const feedbackVariables = ['ADMINSMART_AGENT_API_BASE', 'ADMINSMART_AGENT_TOKEN_FILE', 'ADMINSMART_AGENT_USER_ID', 'ADMINSMART_AGENT_MODE_ID', 'ADMINSMART_AGENT_PRESET_ID', 'ADMINSMART_AGENT_IS_ADMIN'] // 反馈和管理员模型路由依赖的受管身份配置，验证结束必须恢复。
+const feedbackVariables = ['ADMINSMART_AGENT_API_BASE', 'ADMINSMART_AGENT_TOKEN_FILE', 'ADMINSMART_AGENT_USER_ID', 'ADMINSMART_AGENT_MODE_ID', 'ADMINSMART_AGENT_PRESET_ID', 'ADMINSMART_AGENT_IS_ADMIN', 'ADMINSMART_AGENT_NATIVE_BASELINE_JSON', 'ADMINSMART_AGENT_UI_POLICY_SUPPORTED'] // 受管身份与非敏感冻结基线仅供当前隔离装配，结束必须恢复。
 const oldFeedbackEnvironment = new Map(feedbackVariables.map(key => [key, process.env[key]])) // 当前测试之前的环境快照，不写日志或长久配置。
 const capabilityPath = join(temporaryRoot, 'capability.token') // 当前隔离测试自有证明文件，绝不读取真实 Runtime 凭据。
 await writeFile(capabilityPath, 'fixture-runtime-capability', 'utf8')
 Object.assign(process.env, { ADMINSMART_AGENT_API_BASE: 'http://127.0.0.1:9099', ADMINSMART_AGENT_TOKEN_FILE: capabilityPath, ADMINSMART_AGENT_USER_ID: '7', ADMINSMART_AGENT_MODE_ID: 'knowledge', ADMINSMART_AGENT_PRESET_ID: 'knowledge-agent', ADMINSMART_AGENT_IS_ADMIN: '1' })
+process.env.ADMINSMART_AGENT_NATIVE_BASELINE_JSON = JSON.stringify({ subagent: { maxDepth: 1, maxActiveSubagents: 2 }, 'agent-loop': { maxParallelToolCalls: 2 } }) // 本测试冻结模板基线，未读取生产或私人 Profile。
+process.env.ADMINSMART_AGENT_UI_POLICY_SUPPORTED = '1' // 完整装配旧 General 和 Native 桥，所有后端网络在下面明确替换。
 process.env.DSH_HOME = temporaryRoot
 process.env.ADMINSMART_DSH_ROOT = runtimeRoot
 const routes = new Map() // 捕获公开 webServer.register 的真实路由处理器。
@@ -38,9 +45,22 @@ let officialConfig = {
 const officialEntry = { options: { id: 'llm-pi-ai', config: officialConfig } } // 真实 ConfigEditor 唯一条目的简化替身。
 const context = {
   logger: { warn() {} }, // 测试失败正文不能落入用户日志。
-  plugin: () => ({ await: async () => {} }), // DirectoryPicker 无需启动原生对话框。
+  get: key => context[key], // 新官方服务装配检查使用公开查询；真实实例在独立 SDK smoke 验证。
+  provide: (name, value) => workspaceContext.provide(name, value), // 可信live能力通过正式Context服务提供方登记，不能为适配Fake而跳过运行代码。
+  inject: (dependencies, callback) => workspaceContext.inject(dependencies, callback), // 使用真实Cordis依赖等待；本HTTP Fixture未装SettingsController时保持pending，不伪造bootstrap成功。
+  plugin: module => {
+    if (module?.name === 'adminsmart-managed-workspace') {
+      const fiber = workspaceContext.plugin(module) // 完整受管factory执行真实Workspace/Session继承，不Fake其apply。
+      disposers.push(() => fiber.dispose())
+      return fiber
+    }
+    return { state: 2, await: async () => {} } // 其它Host子服务的真实装配由完整SDKassembly目标覆盖，此处专注HTTP协议。
+  },
   workspaceRegistry: {
-    create: async path => ({ title: '知识库工作区', path, attachSession: async () => {} }), // 只满足 Host 兼容工作区契约。
+    archivedSessionIds: [], // 官方WorkspaceFeed和归档Gate的合成空集合。
+    pinnedSessionIds: [], // 官方WorkspaceFeed的合成空固定集合。
+    list: () => [], // 不加载真实登记，Remote首基线只消费空Fixture。
+    create: async path => ({ id: 'fixture-required-workspace', title: '知识库工作区', path, attachSession: async () => {} }), // 官方恢复只作用当前测试cwd，没有磁盘工作区状态。
   },
   sessionPersistence: { list: async () => [] }, // 不加载真实会话历史。
   sessionQuery: { filterSessions: async () => [] }, // 仅返回隔离空目录，不读取用户会话。
@@ -69,7 +89,7 @@ const context = {
     get: id => sessionIds.has(id) ? { id } : undefined, // 仅实现真实 Host API，故意不提供 Client binding 方法。
     list: () => [], // 禁止引入任何真实会话。
   },
-  agents: { get: () => undefined }, // 禁止附件触发真实 Agent 执行。
+  agents: { get: () => undefined, list: () => [] }, // 禁止附件触发真实 Agent 执行，原始Controller基线为合成空Agent。
   commands: { register: () => () => {} }, // 附件命令声明不产生 UI 操作。
   tools: { register: tool => { tools.set(tool.name, tool); return () => tools.delete(tool.name) } }, // 捕获公开工具定义。
   systemPrompt: { section: () => () => {} }, // 提示词注册不调用模型。
@@ -88,11 +108,66 @@ const server = createServer((request, response) => {
     response.end()
   })
 }) // 真实 node:http 自动校验请求分帧和响应终止。
+const originalFetch = globalThis.fetch // 只给本测试 OS 分配的临时 HTTP origin 放行真实传输。
+const unexpectedRequests = [] // 捕获意外外部访问，即使业务层转换错误也必须使测试失败。
+let localOrigin = null // 服务器监听前无真实请求可放行；9099始终走隔离Fake。
+globalThis.fetch = async (url, options = {}) => {
+  const target = new URL(url) // 只比较精确路径，不记录任何请求凭据或正文。
+  if (localOrigin && target.origin === localOrigin) return originalFetch(url, options)
+  if (target.origin === 'http://127.0.0.1:9099') {
+    assert.equal(options.method, 'GET')
+    if (['/internal/agent-model/v1/native-policy', '/internal/agent-model/v1/ui-policy'].includes(target.pathname)) {
+      return Response.json({ revision: 0, settings: null }) // 明确合法未发布策略，不播种管理员默认。
+    }
+    if (target.pathname === '/internal/agent-model/v1/ui-policy/events') {
+      return new Response(new ReadableStream({ start(controller) { controller.close() } }), { headers: { 'content-type': 'text/event-stream' } }) // 离线空失效流，重连和卸载仍走真实生命周期。
+    }
+  }
+  unexpectedRequests.push(target.origin + target.pathname) // 只记录不含query的地址身份，不记录header或正文。
+  throw new Error('Host HTTP fixture禁止真实外部请求')
+}
 
 try {
+  const registryFiber = workspaceContext.plugin(TypertRegistry) // 只提供真实Remote声明注册，不开放HTTP Gateway。
+  await registryFiber.await()
+  const accessFiber = workspaceContext.plugin(RemoteAccess) // 官方Owner/Peer的访问语义保留，不用全允许Fake伪造新权限服务。
+  await accessFiber.await()
+  for (const key of ['workspaceRegistry', 'sessionPersistence', 'sessions', 'sessionQuery', 'agents', 'llm', 'webServer']) workspaceContext.provide(key, context[key]) // 控制器复用同一合成业务状态。
+  workspaceContext.provide('directoryPicker', { capability: () => ({ kind: 'native', pick: async () => null }) }) // 目录选择始终取消，不调用原生OS窗口。
+  workspaceContext.provide('agentDefaultModel', { model: () => undefined, configure: async () => {} }) // 无模型调用或选择更改；真实选择保持由assembly目标验证。
+  workspaceContext.provide('attachments', { imageLimits: { maxImageBytes: 1, maxImagesPerMessage: 1, maxMessageImageBytes: 1 }, listFiles: async () => [], listImages: async () => [] }) // 原始Session依赖只读取合成附件能力。
+  workspaceContext.provide('fileUploads', { registerAgentResolver: () => () => {} }) // 原上传resolver注册生命周期，不启动上传或Agent。
+  workspaceContext.provide('sessionProjections', { register: () => () => {}, onChanged: () => () => {} }) // HTTP不读Projection；原始完整Projection在assembly中实测。
+  workspaceContext.provide('fs', {}) // 该HTTP目标不执行文件读取，真实目录只经受管canonical确认当前cwd。
+  workspaceContext.provide('fileReferences', { list: async () => [] }) // 没有真实文件引用。
+  workspaceContext.provide('workingDirectory', { defaultDirectory: process.cwd() }) // 原始技能目录上下文保持当前测试cwd，不读用户目录。
+  workspaceContext.provide('connection', { fetch: { register: () => () => {} } }) // API文件handler只登记协议回调，本目标不调用它。
   await applyHost(context)
   await new Promise(resolveListening => server.listen(0, '127.0.0.1', resolveListening))
   const origin = `http://127.0.0.1:${server.address().port}` // OS 分配的短期回环端口。
+  localOrigin = origin // 只放行当前临时服务，不放行其它回环业务API。
+  const logoBytes = await readFile(new URL('../assets/aurasearch-logo.webp', import.meta.url)) // 与当前代码快照同一压缩品牌实体，不读真实用户图片。
+  const logoRevision = createHash('sha256').update(logoBytes).digest('hex') // HTTP缓存身份必须来自实际WebP字节。
+  const logoPath = '/adminsmart/assets/aurasearch-logo.webp' // 精确公共品牌路径，不提供任意文件映射。
+  const logoResponse = await fetch(origin + logoPath + '?rev=' + logoRevision, { signal: AbortSignal.timeout(5000) }) // 真实回环HTTP核验MIME、实体和可信版本缓存。
+  assert.equal(logoResponse.status, 200)
+  assert.equal(logoResponse.headers.get('content-type'), 'image/webp')
+  assert.equal(logoResponse.headers.get('content-length'), String(logoBytes.length))
+  assert.equal(logoResponse.headers.get('cache-control'), 'private, max-age=31536000, immutable')
+  assert.equal(logoResponse.headers.get('x-content-type-options'), 'nosniff')
+  assert.deepEqual(Buffer.from(await logoResponse.arrayBuffer()), logoBytes)
+  const logoHead = await fetch(origin + logoPath + '?rev=' + logoRevision, { method: 'HEAD', signal: AbortSignal.timeout(5000) }) // HEAD与GET同一WebP身份，不能发送图像正文。
+  assert.equal(logoHead.status, 200)
+  assert.equal(logoHead.headers.get('content-type'), 'image/webp')
+  assert.equal(logoHead.headers.get('content-length'), String(logoBytes.length))
+  assert.equal((await logoHead.arrayBuffer()).byteLength, 0)
+  const unversionedLogo = await fetch(origin + logoPath, { signal: AbortSignal.timeout(5000) }) // 无版本兼容入口保持禁止缓存，发布不会永久复用旧实体。
+  assert.equal(unversionedLogo.headers.get('cache-control'), 'no-store')
+  await unversionedLogo.arrayBuffer()
+  const invalidLogo = await fetch(origin + logoPath + '?rev=' + '0'.repeat(64), { signal: AbortSignal.timeout(5000) }) // 旧或伪造SHA不得拿到长期缓存实体。
+  assert.equal(invalidLogo.status, 410)
+  assert.equal(invalidLogo.headers.get('cache-control'), 'no-store')
+  await invalidLogo.arrayBuffer()
   /**
    * 请求真实 HTTP 路由并确认响应在期限内结束。
    * @param {string} path 测试路由。
@@ -107,260 +182,23 @@ try {
     }) // 超时会使测试失败，不能把永久解析中视为通过。
     return { status: response.status, body: await response.json() }
   }
-  const switchPath = '/adminsmart/sessions/web-access' // 自有 Host 公共控制路由。
-  const workspaceViewPath = '/adminsmart/workspace-view' // 当前隔离 Runtime Home 的官方侧栏视图入口。
-  const adminModelsPath = '/adminsmart/admin-models' // 只有管理员 Runtime 可读取的非敏感公网模型管理目录。
-  const adminModels = await request(adminModelsPath)
-  assert.equal(adminModels.status, 200)
-  assert.equal(adminModels.body.providers[0].credentialConfigured, true)
-  assert.doesNotMatch(JSON.stringify(adminModels.body), /FIXTURE_PRIVATE_KEY|fixture-secret|apiKeyEnv/u)
-  const discovered = await request(`${adminModelsPath}/discover`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ api: 'openai-responses', baseURL: 'https://models.example.test/v1', apiKey: 'fixture-one-shot-key' }),
-  }) // 管理员显式查询只返回非敏感候选，不执行配置写入。
-  assert.equal(discovered.status, 200)
-  assert.deepEqual(discovered.body.models.map(model => model.id), ['fixture-new-model'])
-  assert.doesNotMatch(JSON.stringify(discovered.body), /fixture-one-shot-key|apiKey/u)
-  const view = { groupBy: 'flat', orderBy: 'manual', archivedFilter: 'show', groupExpansion: { fixture: true }, sessionOrderByAccount: { fixture: ['fixture-session-a'] } } // 不含会话正文的离线视图。
-  assert.deepEqual(await request(workspaceViewPath), { status: 200, body: { view: null } })
-  assert.deepEqual(await request(workspaceViewPath, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ view }),
-  }), { status: 200, body: { view } })
-  assert.deepEqual(await request(workspaceViewPath), { status: 200, body: { view } })
-  assert.equal((await request(workspaceViewPath, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ view: { ...view, groupBy: 'foreign' } }),
-  })).status, 400)
-  const preferencePath = '/adminsmart/model-preference' // Current Runtime user's last explicit selection across new Sessions.
-  const chosen = { provider: 'gpt', model: 'fixture-gpt', reasoningEffort: 'high' } // No Key, URL or file content.
-  assert.deepEqual(await request(preferencePath, { headers: { 'X-AdminSmart-Session': 'fixture-session-a' } }), { status: 200, body: { selection: null } })
-  assert.equal((await request(preferencePath, {
-    method: 'PUT', headers: { 'X-AdminSmart-Session': 'fixture-session-a', 'Content-Type': 'application/json' }, body: JSON.stringify({ selection: chosen }),
-  })).status, 200)
-  const restored = await request(preferencePath, { headers: { 'X-AdminSmart-Session': 'fixture-session-b' } })
-  assert.equal(restored.body.selection.model, chosen.model)
-  assert.equal(restored.body.selection.reasoningEffort, chosen.reasoningEffort)
-  assert.equal((await request(preferencePath, {
-    method: 'PUT', headers: { 'X-AdminSmart-Session': 'already-unloaded-session', 'Content-Type': 'application/json' }, body: JSON.stringify({ selection: chosen }),
-  })).status, 200) // 用户偏好写入不能因为会话快速切换、卸载而被拒绝。
-  assert.equal((await request(preferencePath, {
-    method: 'PUT', headers: { 'X-AdminSmart-Session': '', 'Content-Type': 'application/json' }, body: JSON.stringify({ selection: chosen }),
-  })).status, 400)
-  const sessionHeader = { 'X-AdminSmart-Session': 'fixture-session-a' } // 当前请求绑定的会话身份。
-  assert.deepEqual(await request(switchPath, { headers: sessionHeader }), { status: 200, body: { enabled: true } })
-  for (const enabled of [false, true, false]) {
-    const saved = await request(switchPath, {
-      method: 'PUT',
-      headers: { ...sessionHeader, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled }),
-    }) // 每次写入之后再次 GET，验证不是客户端乐观修改。
-    assert.deepEqual(saved, { status: 200, body: { enabled } })
-    assert.equal((await request(switchPath, { headers: sessionHeader })).body.enabled, enabled)
-  }
-  assert.deepEqual(await request(switchPath, { headers: { 'X-AdminSmart-Session': 'unknown' } }), { status: 200, body: { enabled: true } })
-  assert.equal((await request(switchPath, {
-    method: 'PUT',
-    headers: { 'X-AdminSmart-Session': 'unknown', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enabled: false }),
-  })).status, 400)
-  process.stdout.write('host_http_switch=ok\n')
   assert.equal((await request('/adminsmart/feedback/read', { method: 'POST', body: '{}', headers: { Cookie: 'fixture-cookie' } })).status, 403)
   const feedbackResponse = await request('/adminsmart/feedback/read', { method: 'POST', body: '{}', headers: { Authorization: 'Bearer fixture-runtime-capability' } }) // 有证明的回环只读请求，不替任何用户写反馈。
   assert.equal(feedbackResponse.status, 200)
   assert.deepEqual(feedbackResponse.body.rows, [])
   assert.doesNotMatch(JSON.stringify(feedbackResponse.body), /fixture-runtime-capability/)
-  const privatePath = '/adminsmart/private-model-reasoning?providerId=gpt' // 未发布 Provider 仍能独立读取的同源路由。
-  assert.deepEqual((await request(privatePath)).body.models, [{ id: 'fixture-gpt', name: 'Fixture GPT Model', reasoningEfforts: {} }])
-  const invalidReasoning = await request('/adminsmart/private-model-reasoning', {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ providerId: 'gpt', modelId: 'fixture-gpt', reasoningEfforts: { ultra: 'ultra' } }),
-  }) // 不支持的等级必须在调用官方编辑器前拒绝。
-  assert.equal(invalidReasoning.status, 400)
-  assert.equal(officialConfig.providers.gpt.models[0].reasoningEfforts, false)
-  const originalFetch = globalThis.fetch // 当前测试仅替换 Host 到合成业务目录的网络边界。
-  try {
-    globalThis.fetch = (url, options) => String(url).startsWith('http://127.0.0.1:9099/internal/agent-model/')
-      ? Promise.resolve({ ok: true, json: async () => ({ models: [] }) })
-      : originalFetch(url, options)
-    const saved = await request('/adminsmart/private-model-reasoning', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ providerId: 'gpt', modelId: 'fixture-gpt', reasoningEfforts: { off: null, high: 'high' } }),
-    }) // 后端无发布目录时仍保存官方私有模型。
-    assert.equal(saved.status, 200)
-    assert.deepEqual(saved.body.models[0].reasoningEfforts, { off: null, high: 'high' })
-    assert.doesNotMatch(JSON.stringify(saved.body), /FIXTURE_PRIVATE_KEY|fixture-runtime-capability/u)
-    globalThis.fetch = (url, options) => String(url).startsWith('http://127.0.0.1:9099/internal/agent-model/')
-      ? Promise.reject(new Error('fixture backend unavailable'))
-      : originalFetch(url, options)
-    const degraded = await request('/adminsmart/private-model-reasoning', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ providerId: 'gpt', modelId: 'fixture-gpt', reasoningEfforts: {} }),
-    }) // 业务目录暂不可用时必须如实报告私有保存成功和同步告警。
-    assert.equal(degraded.status, 200)
-    assert.match(degraded.body.warning, /已保存.*同步失败/u)
-    assert.equal(officialConfig.providers.gpt.models[0].reasoningEfforts, false)
-  } finally { globalThis.fetch = originalFetch }
-  officialConfig.providers.gpt.models[0].reasoningEfforts = false // 首次保存的第三方模型尚无任何思考等级映射。
-  context.credentials.resolve = async ref => ref === 'FIXTURE_PRIVATE_KEY' ? { value: 'fixture-secret' } : undefined // 私有 Key 只供 Host 到后端使用。
-  const modelActions = [] // 当前测试范围内模型用途请求的非敏感记录。
-  let defaultEffort = null // 假后端保存的单模型思考等级。
-  let harnessDefault = null // 假后端保存的 Harness 新会话兜底身份。
-  const managedModelRequests = [] // 捕获隔离假后端访问，退役知识动作不能触发发布、能力写入或默认用途调用。
-  try {
-    globalThis.fetch = (url, options) => {
-      const address = String(url) // 测试只接管受管回环 API，真实本机 HTTP 请求交还 Node fetch。
-      if (!address.startsWith('http://127.0.0.1:9099/internal/agent-model/')) return originalFetch(url, options)
-      managedModelRequests.push({ address, method: options.method ?? 'GET' }) // 仅记录测试自建 API 地址和方法，不保存请求凭据或正文。
-      if (address.endsWith('/harness-providers/gpt')) {
-        assert.equal(JSON.parse(options.body).apiKey, 'fixture-secret')
-        return Promise.resolve({ ok: true, json: async () => ({ providers: [] }) })
-      }
-      if (address.endsWith('/catalog')) return Promise.resolve({ ok: true, json: async () => ({
-        revision: 7, providers: [{ id: 'agent-gpt', models: [{ id: 'fixture-gpt', defaultReasoningEffort: 'high' }] }],
-      }) }) // 普通用户可读取当前目录的非敏感逐模型默认档位。
-      if (address.endsWith('/model-policy')) return Promise.resolve({ ok: true, json: async () => ({
-        models: [{ providerId: 'agent-gpt', harnessProviderId: 'agent-gpt', modelId: 'shared-fixture-gpt', modelName: officialConfig.providers.gpt.models[0].id, defaultReasoningEffort: defaultEffort }],
-        defaultChatModelId: harnessDefault,
-        defaultKnowledgeModelId: 'shared-fixture-gpt', // 旧后台响应字段不能阻止聊天能力清空，也不能恢复动态知识管理。
-      }) })
-      if (address.endsWith('/reasoning') && options.method === 'PUT') {
-        const body = JSON.parse(options.body) // 等级更新必须来自官方模型能力，不接受浏览器捏造映射。
-        modelActions.push(body)
-        defaultEffort = body.defaultReasoningEffort
-        return Promise.resolve({ ok: true, json: async () => ({ providers: [] }) })
-      }
-      if (address.endsWith('/model-default')) {
-        const body = JSON.parse(options.body) // 当前动态默认入口只能维护 Harness 聊天兜底。
-        modelActions.push(body)
-        assert.equal(body.target, 'harness')
-        harnessDefault = body.modelId
-        return Promise.resolve({ ok: true, json: async () => ({ models: [] }) })
-      }
-      throw new Error('unexpected managed model route')
+  const retiredPaths = ['/adminsmart/sessions/web-access', '/adminsmart/admin-models', '/adminsmart/admin-models/discover', '/adminsmart/private-model-reasoning', '/adminsmart/model-reasoning', '/adminsmart/model-configuration', '/adminsmart/model-defaults', '/adminsmart/model-preference', '/adminsmart/workspace-view', '/adminsmart/model-policy', '/adminsmart/model-provider/publish'] // 退役能力必须停止装配，而非仅在页面隐藏；官方状态与Models保留所有权。
+  for (const role of ['1', '0']) {
+    process.env.ADMINSMART_AGENT_IS_ADMIN = role
+    for (const path of retiredPaths) {
+      assert.equal(routes.has(path), false)
+      const response = await fetch(origin + path, { headers: { Origin: origin, 'Sec-Fetch-Site': 'same-origin' }, signal: AbortSignal.timeout(5000) }) // 实际隔离HTTP必须无法重新调用旧写回或默认覆盖能力。
+      assert.equal(response.status, 404)
     }
-    const route = '/adminsmart/model-configuration?providerId=gpt' // 用户可见配置只包含名字和能力，不返回 API Key。
-    const listed = await request(route)
-    assert.equal(listed.status, 200)
-    for (const retiredField of ['knowledgeAvailable', 'knowledgeCompatible', 'isKnowledgeModel']) {
-      assert.equal(Object.hasOwn(listed.body.models[0], retiredField), false) // 聊天目录不再投影固定知识处理的动态用途。
-    }
-    assert.equal(listed.body.models[0].managedPublished, true)
-    assert.doesNotMatch(JSON.stringify(listed.body), /fixture-secret|FIXTURE_PRIVATE_KEY/u)
-    const actionPath = '/adminsmart/model-configuration' // 管理动作只提交路由、模型 ID 和枚举。
-    const put = (action, extra = {}) => request(actionPath, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ providerId: 'gpt', modelId: 'fixture-gpt', action, ...extra }),
-    })
-    for (const invalid of [['off'], ['minimal'], ['ultra'], ['low', 'low']]) {
-      assert.equal((await put('efforts', { reasoningEfforts: invalid })).status, 400) // 多选入口拒绝隐藏档位、未知档位和重复项。
-    }
-    assert.equal((await put('efforts', { reasoningEfforts: ['low', 'high'] })).body.models[0].defaultReasoningEffort, 'low')
-    assert.deepEqual(officialConfig.providers.gpt.models[0].reasoningEfforts, { low: 'low', high: 'high' })
-    assert.equal((await put('efforts', { reasoningEfforts: ['high', 'max'] })).body.models[0].defaultReasoningEffort, 'high')
-    assert.deepEqual(officialConfig.providers.gpt.models[0].reasoningEfforts, { high: 'high', max: 'max' }) // 取消 low 只移除这一档。
-    assert.equal((await put('efforts', { reasoningEfforts: [] })).body.models[0].defaultReasoningEffort, null)
-    assert.equal(officialConfig.providers.gpt.models[0].reasoningEfforts, false) // 聊天模型可清空可用档位，旧知识默认字段不能影响该动作。
-    assert.equal((await put('effort', { reasoningEffort: 'invalid' })).status, 400)
-    assert.equal((await put('effort', { reasoningEffort: 'high' })).status, 400)
-    assert.equal((await put('effort', { reasoningEffort: 'high', wireValue: 'high' })).body.models[0].defaultReasoningEffort, 'high')
-    assert.equal(officialConfig.providers.gpt.models[0].reasoningEfforts.high, 'high')
-    const beforeRetiredProfile = JSON.stringify(officialConfig) // 旧页面知识动作不能修改官方 Profile 的任何能力或凭据字段。
-    const beforeRetiredRequests = managedModelRequests.length // 已退役动作应在所有业务发布和写入之前拒绝。
-    const beforeRetiredActions = modelActions.length // 动态默认与聊天能力写入记录必须保持不变。
-    for (const [action, extra] of [['knowledge', {}], ['off-wire', { wireValue: '' }], ['off-wire', { wireValue: 'none' }], ['knowledge', { modelId: 'missing-old-model' }]]) {
-      const retired = await put(action, extra) // 模拟旧管理员页面重发已退役动作，不访问真实模型。
-      assert.equal(retired.status, 400)
-      assert.equal(retired.body.error, 'LightRAG 知识模型已固定，不支持动态知识配置')
-    }
-    assert.equal(JSON.stringify(officialConfig), beforeRetiredProfile)
-    assert.equal(managedModelRequests.length, beforeRetiredRequests)
-    assert.equal(modelActions.length, beforeRetiredActions)
-
-    officialConfig.providers.gpt.models[0].reasoningEfforts.high = 'vendor-high' // 聊天模型已有非同名档位保持原样。
-    officialConfig.providers.gpt.models[0].reasoningEfforts.off = 'none' // 合法聊天 off 元数据不因知识动态入口退役而删除。
-    assert.equal((await put('efforts', { reasoningEfforts: ['high', 'max'] })).body.models[0].defaultReasoningEffort, 'high')
-    assert.deepEqual(officialConfig.providers.gpt.models[0].reasoningEfforts, { high: 'vendor-high', max: 'max', off: 'none' })
-    assert.equal((await put('harness')).body.models[0].isHarnessDefault, true)
-    assert.equal((await put('efforts', { reasoningEfforts: [] })).status, 200) // 明确清空聊天能力不会触及后端独立固定的 LightRAG 配置。
-    assert.equal(officialConfig.providers.gpt.models[0].reasoningEfforts, false)
-    assert.deepEqual(modelActions.map(action => action.target ?? action.defaultReasoningEffort), ['low', 'high', null, 'high', 'high', 'harness', null])
-
-    officialConfig.providers.gpt.models[0].id = 'gpt-6.1-sol' // 用户保留的聊天模型不要求拥有知识关闭声明。
-    officialConfig.providers.gpt.models[0].reasoningEfforts = { low: 'low', high: 'high' }
-    const retainedChatDefault = await put('harness', { modelId: 'gpt-6.1-sol' }) // GPT-6.1 Sol 仍可作为聊天兜底。
-    assert.equal(retainedChatDefault.status, 200)
-    assert.equal(retainedChatDefault.body.models[0].isHarnessDefault, true)
-    assert.deepEqual(officialConfig.providers.gpt.models[0].reasoningEfforts, { low: 'low', high: 'high' })
-    officialConfig.providers.gpt.models[0].id = 'fixture-gpt' // 恢复后续管理员目录测试的合成身份。
-    officialConfig.providers.gpt.models[0].reasoningEfforts = false
-    officialConfig.providers.gpt.models.push({ id: 'gpt-5.2', name: 'GPT-5.2', reasoningEfforts: false }) // 官方新模型先于受管后台同步出现。
-    const pendingSync = await request(route)
-    assert.equal(pendingSync.body.models[1].managedPublished, false)
-    assert.equal(Object.hasOwn(pendingSync.body.models[1], 'knowledgeAvailable'), false)
-    officialConfig.providers.gpt.models.pop() // 测试自有模型在下一断言前恢复，不改真实 Provider。
-    process.env.ADMINSMART_AGENT_IS_ADMIN = '0'
-    try {
-      const defaults = await request('/adminsmart/model-defaults')
-      assert.deepEqual(defaults, { status: 200, body: { revision: 7, defaults: [{ provider: 'agent-gpt', model: 'fixture-gpt', effort: 'high' }] } })
-      assert.doesNotMatch(JSON.stringify(defaults.body), /fixture-secret|FIXTURE_PRIVATE_KEY/u)
-    } finally { process.env.ADMINSMART_AGENT_IS_ADMIN = '1' }
-  } finally { globalThis.fetch = originalFetch }
-  const currentAdminModels = await request(adminModelsPath) // 使用最新官方配置指纹编辑，不碰真实模型或凭据。
-  const unconfirmedProfile = currentAdminModels.body.providers.find(provider => provider.routeId === 'gpt') // 当前隔离 Fixture 的管理员供应商。
-  let publishedUnknownCap // 保存 Harness 可选字段后受管目录收到的真实 JSON 值。
-  try {
-    globalThis.fetch = (url, options) => {
-      if (!String(url).startsWith('http://127.0.0.1:9099/internal/agent-model/')) return originalFetch(url, options) // 本地测试服务器请求照常完成。
-      publishedUnknownCap = JSON.parse(options.body).models[0].maxOutputTokens
-      return Promise.resolve({ ok: true, json: async () => ({ providers: [] }) }) // 受管发布仍只在隔离假后端完成。
-    }
-    const savedWithoutCap = await request(adminModelsPath, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        routeId: 'gpt', fingerprint: unconfirmedProfile.fingerprint,
-        displayName: unconfirmedProfile.displayName, api: unconfirmedProfile.api,
-        baseURL: unconfirmedProfile.baseURL, apiKey: '',
-        models: [{ ...unconfirmedProfile.models[0], maxTokens: '' }],
-      }),
-    }) // Harness 与业务目录均保留未知输出能力，不提交通用 fallback。
-    assert.equal(savedWithoutCap.status, 200)
-    assert.equal(savedWithoutCap.body.published, true)
-    assert.equal(savedWithoutCap.body.providers.find(provider => provider.routeId === 'gpt').models[0].maxTokens, null)
-    assert.equal(publishedUnknownCap, null)
-    assert.doesNotMatch(JSON.stringify(savedWithoutCap.body), /fixture-secret|FIXTURE_PRIVATE_KEY/u)
-  } finally { globalThis.fetch = originalFetch }
-  const pendingAdminModels = await request(adminModelsPath) // 补齐输出能力前读取清空后的最新指纹。
-  const pendingProvider = pendingAdminModels.body.providers.find(provider => provider.routeId === 'gpt') // 再次应用同一官方供应商。
-  let publishedOutputCap = null // 仅记录合成后端收到的模型能力，不记录 Key。
-  try {
-    globalThis.fetch = (url, options) => {
-      if (!String(url).startsWith('http://127.0.0.1:9099/internal/agent-model/')) return originalFetch(url, options)
-      publishedOutputCap = JSON.parse(options.body).models[0].maxOutputTokens
-      return Promise.resolve({ ok: true, json: async () => ({ providers: [] }) })
-    }
-    const confirmed = await request(adminModelsPath, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        routeId: 'gpt', fingerprint: pendingProvider.fingerprint,
-        displayName: pendingProvider.displayName, api: pendingProvider.api,
-        baseURL: pendingProvider.baseURL, apiKey: '',
-        models: [{ ...pendingProvider.models[0], maxTokens: 8192 }],
-      }),
-    }) // 管理员确认真实上限后，原业务发布路径恢复正常。
-    assert.equal(confirmed.status, 200)
-    assert.equal(confirmed.body.published, true)
-    assert.equal(publishedOutputCap, 8192)
-  } finally { globalThis.fetch = originalFetch }
-  process.env.ADMINSMART_AGENT_IS_ADMIN = '0'
-  try {
-    assert.equal((await request(privatePath)).status, 403)
-    assert.equal((await request('/adminsmart/model-configuration?providerId=gpt')).status, 403)
-    assert.equal((await request(adminModelsPath)).status, 403)
-    assert.equal((await request(adminModelsPath, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403)
-    assert.equal((await request(adminModelsPath, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403)
-    assert.equal((await request(`${adminModelsPath}/discover`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403)
   }
-  finally { process.env.ADMINSMART_AGENT_IS_ADMIN = '1' }
-  assert.equal((await request(privatePath, { headers: { Origin: 'http://evil.example.test' } })).status, 400)
+  process.env.ADMINSMART_AGENT_IS_ADMIN = '1'
+  assert.equal(officialConfig.providers.gpt.models[0].reasoningEfforts, false) // 仅保留原始合成Profile，退役不改用户已保存能力。
+  process.stdout.write('host_http_retired_routes_and_logo=ok\n')
 } finally {
   server.closeAllConnections()
   await new Promise(resolveClosed => server.close(resolveClosed))
@@ -368,6 +206,8 @@ try {
     const dispose = await pendingDisposer // 等待异步插件初始化完结再释放。
     if (typeof dispose === 'function') await dispose()
   }
+  await workspaceContext.fiber.dispose() // 释放真实控制器与TypertRegistry根，不能把监听器留给下个测试。
+  globalThis.fetch = originalFetch // 所有Host后台循环清理完毕后恢复调用方传输。
   if (oldHome === undefined) delete process.env.DSH_HOME
   else process.env.DSH_HOME = oldHome
   if (oldRuntimeRoot === undefined) delete process.env.ADMINSMART_DSH_ROOT
@@ -377,4 +217,5 @@ try {
     else process.env[key] = value
   }
   await rm(temporaryRoot, { recursive: true, force: true })
+  assert.deepEqual(unexpectedRequests, []) // 意外外部服务请求不能被业务友好错误吞掉而造成假通过。
 }

@@ -1,4 +1,4 @@
-/** 只读装载当前固定 RC2 公开 Config 与原封不动的 Client 包；协议依赖全部使用离线 Fake。 */
+/** 只读装载当前固定官方公开Config与原封不动的Client包；外部协议数据全部使用离线Fake。 */
 
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
@@ -66,7 +66,7 @@ class FakeService {
 
 /**
  * 用官方 ModuleLoader 契约装载原封不动的 Client 文件。
- * @param {object} sdk 当前固定 RC2 SDK。
+ * @param {object} sdk 当前固定官方SDK。
  * @param {string} name 官方包名。
  * @returns {Promise<object>} 官方 exports.apply/inject；其服务、store 和 React 依赖在进程内提供。
  * @sideEffects 仅读 npm 包文件，不改写、补丁或向上游注入导出；不创建浏览器。
@@ -80,6 +80,7 @@ async function officialClient(sdk, name) {
     structuredClone,
   }, { filename: path, timeout: 5_000 })
   assert.equal(registration.id, name)
+  const { seeds } = await (await import('./official-client-boot-fixture.mjs')).originalClientPlatform() // 新版平台依赖采用真实官方Web种子，不能用空对象掩盖Tanstack等公开依赖。
   return registration.factory(dependency => {
     if (dependency === '@deepseek-ai/cordis') return { Service: FakeService }
     if (dependency === '@deepseek-ai/dsh-client-store') return { createSnapshotStore: snapshotStore, defineStore: spec => spec }
@@ -88,6 +89,7 @@ async function officialClient(sdk, name) {
       return new Proxy({}, { get: () => primitive })
     }
     if (['react', 'react/jsx-runtime', 'react-dom'].includes(dependency)) return sdk.require(dependency)
+    if (Object.hasOwn(seeds, dependency)) return seeds[dependency] // 未被本Fixture明确隔离的纯前端平台依赖保持官方实现。
     throw new Error(`未隔离的官方 Client 依赖：${dependency}`)
   })
 }
@@ -107,7 +109,7 @@ function clientContext(namespaces, loopback) {
   const noOperation = () => () => {} // 不涉及会话分析的官方注册行为。
   const ctx = {
     remote: {
-      $host: { isLoopback: loopback }, // 显式验证官方 Host 与 memory 分支，不能据此声称真实部署走哪一支。
+      $host: { isLoopback: loopback }, // 仅合成Host公告；当前官方两种入口均从Host获取描述，不能据此推断全站角色。
       $on(name, callback) { events.set(name, callback); return () => events.delete(name) },
       settings: {
         async describe() { state.reads += 1; return { ok: true, value: { writable: false, hasDocument: false, namespaces: state.namespaces } } },
@@ -124,6 +126,7 @@ function clientContext(namespaces, loopback) {
     slots: {
       inject(_name, register) { return register() },
       register(options, component) { slots.set(`${options.name}:${options.id}`, { options, component }); return () => {} },
+      registerFactory(options, component) { slots.set(`${options.name}:${options.id}`, { options, component }); return () => {} }, // 新版官方推理内容工厂仍只记录注册，不伪造聊天呈现。
     },
     uiSession: { provide: noOperation },
     uiConversation: {
@@ -136,11 +139,11 @@ function clientContext(namespaces, loopback) {
   return { ctx, state, slots, events, dictionaries, async close() { for (const dispose of cleanups.reverse()) await dispose() } }
 }
 
-test('固定 RC2 Config 覆盖八项字段、全部枚举、字号及官方未指定状态', { skip: !runtimeRoot }, async () => {
+test('固定alpha.3 Config覆盖八项字段、全部枚举、字号及官方未指定状态', { skip: !runtimeRoot }, async () => {
   const sdk = await officialSdk() // 只读当前指定 SDK，不装载 Gateway 或用户 Runtime。
   const rows = describeOfficial(sdk.modules) // 官方实际默认值及 optional 字段。
   const defaults = captureGeneralSettings({ describe: () => rows }) // 被测白名单捕获应与官方解析值一致。
-  assert.deepEqual(defaults, { locale: null, theme: 'system', fontSize: 14, transcriptView: null, performanceUsage: 'detailed', developerTools: true, busyEnter: 'queue', linkOpening: 'sidebar' })
+  assert.deepEqual(defaults, { locale: null, theme: 'light', fontSize: 14, transcriptView: null, performanceUsage: 'detailed', developerTools: true, busyEnter: 'queue', linkOpening: 'sidebar' })
   assert.deepEqual(sdk.modules.get('ui-chat').TRANSCRIPT_VIEW_MODES, ['compact', 'standard', 'detailed', 'verbose'])
   assert.equal(sdk.modules.get('ui-chat').DEFAULT_TRANSCRIPT_VIEW_MODE, 'detailed')
   assert.deepEqual(sdk.modules.get('ui-theme').THEME_PREFERENCES, ['light', 'dark', 'system'])
@@ -173,7 +176,7 @@ test('固定 RC2 Config 覆盖八项字段、全部枚举、字号及官方未�
   }
 })
 
-test('固定alpha.1原生Schema以独立owned entry描述，false回写只命中实际namespace', { skip: !runtimeRoot }, async () => {
+test('固定alpha.3原生Schema以独立owned entry描述，false回写只命中实际namespace', { skip: !runtimeRoot }, async () => {
   const sdk = await officialSdk() // 原始SDK仅提供公开Config，不修改或复制任何第三方文件。
   const rows = describeOfficial(sdk.modules, { 'ui-settings': { enabled: true } }) // 所有元数据与有效值来自固定版真实Schema。
   const owned = 'adminsmart-shared-settings' // 唯一wrapper entry ID，原ui-settings被Profile停用。
@@ -201,7 +204,7 @@ test('固定alpha.1原生Schema以独立owned entry描述，false回写只命中
   assert.equal(rows.some(row => row.ns === 'ui-settings'), false)
 })
 
-test('原始 RC2 Client 在 Host 条件成立时采用只读设置，verbose 是完全展开且旧值按 detailed 显示', { skip: !runtimeRoot }, async () => {
+test('原始alpha.3 Client采用Host只读设置，verbose是完全展开且旧值按detailed显示', { skip: !runtimeRoot }, async () => {
   const sdk = await officialSdk() // 正式共享 SDK 的公开模块。
   const settings = await officialClient(sdk, packages['ui-settings']) // 原始官方 Settings Client，无源代码改写。
   const chat = await officialClient(sdk, packages['ui-chat']) // 原始官方 General transcript/统计/链接 Client。
@@ -218,10 +221,18 @@ test('原始 RC2 Client 在 Host 条件成立时采用只读设置，verbose 是
     const element = row.component({
       useTranscriptView: selector => selector(props.hooks.transcriptView.getSnapshot()), // 官方 hook 协议的离线读取。
       setTranscriptView: props.setTranscriptView, // 仅传入，不触发管理员 UI 编辑。
+      useCollapseTiming: selector => selector(props.hooks.collapseTiming.getSnapshot()), // 当前折叠时机来自官方Host配置，仍与自有共享八字段白名单独立。
+      setCollapseTiming: props.setCollapseTiming, // 使用官方原始行级动作，不自行实现折叠规则。
       t: fixture.ctx.locale.bind(row.options.locale), // 官方注册中文文案。
     }) // 官方 General 行返回的 React 元素，不挂载 renderer。
-    assert.deepEqual(Array.from(element.props.options, option => option.id), ['compact', 'standard', 'detailed', 'verbose'])
-    assert.equal(element.props.options.find(option => option.id === 'verbose').label, '完全展开')
+    const transcriptElement = element.props.children[0] // 新版公开返回 Fragment 的首行仍是工作步骤展示，次行是独立折叠时机。
+    assert.deepEqual(Array.from(transcriptElement.props.options, option => option.id), ['compact', 'standard', 'detailed', 'verbose'])
+    assert.equal(transcriptElement.props.options.find(option => option.id === 'verbose').label, '完全展开')
+    assert.equal(props.hooks.collapseTiming.getSnapshot(), 'completion')
+    fixture.state.namespaces = describeOfficial(sdk.modules, { 'ui-chat': { collapseTiming: 'next-input' } }) // 模拟管理员在Host保存，普通用户只采用描述，不调用原生编辑setter。
+    fixture.events.get('settings/document-updated')()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(props.hooks.collapseTiming.getSnapshot(), 'next-input')
     for (const [saved, expected] of [[undefined, 'detailed'], [null, 'detailed'], ['normal', 'detailed'], ['expanded', 'detailed'], ['verbose', 'verbose']]) {
       fixture.state.namespaces = describeOfficial(sdk.modules, { 'ui-chat': { transcriptView: saved } }) // 替换合成共享描述，模拟保存后回读。
       fixture.events.get('settings/document-updated')()
@@ -232,25 +243,34 @@ test('原始 RC2 Client 在 Host 条件成立时采用只读设置，verbose 是
   } finally { await fixture.close() }
 })
 
-test('原始 RC2 非 Host 分支使用 memory，不读取只读 Remote，联调不能把它误当作已采用', { skip: !runtimeRoot }, async () => {
+test('原始alpha.3非loopback入口也立即读取Host只读描述，公开表单拒绝写入且采用共享更新', { skip: !runtimeRoot }, async () => {
   const sdk = await officialSdk() // 同一固定官方安装，无真实网络。
   const settings = await officialClient(sdk, packages['ui-settings']) // 原始官方设置 Client。
   const fixture = clientContext(describeOfficial(sdk.modules), false) // 明确模拟官方非 loopback 条件，不推断真实部署。
   try {
     settings.apply(fixture.ctx)
     await new Promise(resolve => setImmediate(resolve))
-    assert.equal(fixture.ctx.configForms.get('ui-chat').getSnapshot().mode, 'memory')
-    assert.equal(fixture.ctx.configForms.get('ui-chat').getSnapshot().value, undefined)
-    assert.equal(fixture.state.reads, 0)
+    const form = fixture.ctx.configForms.get('ui-chat') // 原始公开Host ConfigForm，alpha.3已移除旧memory回退。
+    assert.equal(form.getSnapshot().status, 'ready')
+    assert.equal(form.getSnapshot().revision, 1)
+    assert.equal(form.getSnapshot().writable, false)
+    assert.equal(form.getSnapshot().value.performanceUsage, 'detailed')
+    assert.equal(fixture.state.reads, 1)
     assert.equal(fixture.state.mutations, 0)
-    const form = fixture.ctx.configForms.get('ui-chat') // 原始公开 memory ConfigForm，不读私有 Store。
     let notifications = 0 // 观察公开订阅能否捕获原生本地编辑。
     const unsubscribe = form.subscribe(() => { notifications += 1 }) // 与拟议浏览器桥相同的公开订阅入口。
-    assert.equal(await form.set('transcriptView', 'verbose'), false)
-    assert.equal(form.getSnapshot().value, undefined)
-    assert.equal(notifications, 0, 'RC2 memory set 不发布快照，桥不能只靠公开订阅捕获原生选择')
-    fixture.ctx.configForms.describe().acceptView(fixture.state.namespaces.find(row => row.ns === 'ui-chat'))
-    assert.equal(form.getSnapshot().value, undefined, 'acceptView 也不能为尚无完整描述的 memory scope 播种')
+    const accepted = structuredClone(form.getSnapshot().value) // 原始Host接受值，拒绝写入后不能伪装成本地成功。
+    await assert.rejects(form.set('transcriptView', 'verbose'), /只读 Remote 不能写入/u) // alpha.3原表单把传输拒绝交给调用方；真实权限在Host拒绝，不能吞掉此错误。
+    assert.deepEqual(form.getSnapshot().value, accepted)
+    assert.equal(fixture.state.mutations, 1, '显式越权写尝试必须实际到达拒绝入口')
+    assert.equal(notifications, 0, '只读表单不能把被拒绝的编辑发布成本地成功状态')
+    fixture.state.namespaces = describeOfficial(sdk.modules, { 'ui-chat': { transcriptView: 'verbose' } }) // 模拟管理员已保存后Host返回的新共享描述。
+    fixture.events.get('settings/document-updated')()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(form.getSnapshot().value.transcriptView, 'verbose')
+    assert.ok(notifications > 0, '真实Host描述变化必须经原生公开订阅发布')
+    assert.equal(fixture.state.reads, 2)
+    assert.equal(fixture.state.mutations, 1, '共享describe采用不能产生额外Remote写尝试，先前唯一尝试已明确拒绝')
     unsubscribe()
   } finally { await fixture.close() }
 })

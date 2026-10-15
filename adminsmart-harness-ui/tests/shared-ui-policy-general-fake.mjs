@@ -7,7 +7,7 @@ import { applyGeneralSettings, captureGeneralSettings, installSharedUiPolicy } f
 
 const DEFAULT_POLICY = Object.freeze({
   locale: null, // 官方未指定语言，不将浏览器解析结果当作保存值。
-  theme: 'system', // 官方默认外观偏好。
+  theme: 'light', // 新记录的历史兼容值；个人明暗不参与共享。
   fontSize: 14, // 官方默认字号。
   transcriptView: null, // RC2 Host 可以未指定，由官方 Web Client 显示 detailed。
   performanceUsage: 'detailed', // 官方默认性能统计详情。
@@ -18,7 +18,6 @@ const DEFAULT_POLICY = Object.freeze({
 
 const SUPPORTED_VALUES = Object.freeze({
   locale: [null, 'zh', 'en', 'zh-Hans-CN', 'en-US'], // 两种内建语言、未指定与官方合法区域标签样本。
-  theme: ['light', 'dark', 'system'], // 全部官方外观选项。
   fontSize: Array.from({ length: 13 }, (_, index) => index + 10), // 全部 RC2 整数字号 10-22。
   transcriptView: ['compact', 'standard', 'detailed', 'verbose', 'normal', 'expanded', null], // 四种当前模式、两种兼容旧值和未指定。
   performanceUsage: ['compact', 'detailed'], // 全部统计详情选项。
@@ -257,7 +256,7 @@ test('GET 已发现新修订时，旧管理员编辑不能冒用新修订覆盖�
   admin.settings.edit('transcriptView', 'verbose')
   t.mock.timers.tick(200)
   await flush()
-  assert.deepEqual(captureGeneralSettings(admin.settings), backend.remote.settings)
+  assert.deepEqual(captureGeneralSettings(admin.settings, backend.remote.settings.theme), backend.remote.settings)
   assert.equal(backend.puts.length, 0, '不能用刚 GET 的修订二为陈旧编辑开通写入')
 })
 
@@ -273,7 +272,7 @@ test('GET 后的 PUT CAS 冲突只采用胜出策略，不重发丢失的旧编�
   assert.equal(backend.puts[0].expectedRevision, 1)
   t.mock.timers.tick(30_000)
   await flush()
-  assert.deepEqual(captureGeneralSettings(admin.settings), backend.remote.settings)
+  assert.deepEqual(captureGeneralSettings(admin.settings, backend.remote.settings.theme), backend.remote.settings)
   assert.equal(backend.puts.length, 1)
 })
 
@@ -296,11 +295,11 @@ test('采用新策略中途失败时，混合状态不能被管理员反向发�
   admin.settings.state.failNamespace = 'ui-chat'
   t.mock.timers.tick(30_000)
   await flush()
-  assert.equal(captureGeneralSettings(admin.settings).theme, 'dark')
+  assert.equal(admin.settings.entries.get('ui-theme').preference, 'light', '共享采用不能改写本人主题')
   assert.equal(captureGeneralSettings(admin.settings).transcriptView, null)
   t.mock.timers.tick(30_000)
   await flush()
-  assert.deepEqual(captureGeneralSettings(admin.settings), backend.remote.settings)
+  assert.deepEqual(captureGeneralSettings(admin.settings, backend.remote.settings.theme), backend.remote.settings)
   assert.equal(backend.puts.length, 0)
 })
 
@@ -313,7 +312,7 @@ test('采用仅写固定展示字段，并携带原生修订，unset 不清空�
   assert.equal(settings.entries.get('locale').futurePresentation, 'keep-locale')
   assert.equal(settings.entries.get('ui-theme').futurePresentation, 'keep-theme')
   assert.deepEqual(settings.entries.get('non-general'), { marker: 'keep-unrelated' })
-  assert.deepEqual(settings.writes.map(write => write.ns), ['locale', 'ui-theme'])
+  assert.deepEqual(settings.writes.map(write => write.ns), ['locale'])
   assert.deepEqual(captureGeneralSettings(settings), DEFAULT_POLICY)
 })
 
@@ -430,6 +429,6 @@ test('普通用户在尚无策略时不播种，管理员配置出现后才只�
   backend.remote = { revision: 1, settings: { ...DEFAULT_POLICY, theme: 'dark' } }
   t.mock.timers.tick(30_000)
   await flush()
-  assert.deepEqual(captureGeneralSettings(ordinary.settings), backend.remote.settings)
+  assert.deepEqual(captureGeneralSettings(ordinary.settings, backend.remote.settings.theme), backend.remote.settings)
   assert.equal(backend.puts.length, 0)
 })

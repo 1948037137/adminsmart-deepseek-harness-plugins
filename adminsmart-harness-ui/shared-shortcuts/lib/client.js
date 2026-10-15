@@ -33,7 +33,10 @@ window.__ModuleLoader__.load({
           close.addEventListener('click', () => { alert?.remove(); alert = null })
           alert.appendChild(close)
         }
-        import(new URL('./adminsmart/shared-shortcuts-client.mjs', window.location.href).href).then(({ installSharedShortcutsClient }) => {
+        const moduleUrl = new URL('./adminsmart/shared-shortcuts-client.mjs', window.location.href) // 固定同源资源；URL构造会丢弃页面query，不让地址栏决定代码版本。
+        const moduleRevision = window.__ADMINSMART_SHARED_SHORTCUTS_CLIENT_REVISION__ // 唯一可信来源是当前Host在官方index中注入的代码SHA。
+        if (typeof moduleRevision === 'string' && /^[a-f0-9]{64}$/u.test(moduleRevision)) moduleUrl.searchParams.set('rev', moduleRevision) // 无有效HostSHA时兼容legacy不缓存入口，不猜测或沿用页面参数。
+        import(moduleUrl.href).then(({ installSharedShortcutsClient }) => {
           if (!disposed) bridge = installSharedShortcutsClient({ shortcuts: ctx.shortcuts, notifyError })
         }).catch(() => notifyError('共享快捷键加载失败，请刷新后重试'))
         return () => { disposed = true; bridge?.dispose(); alert?.remove() }

@@ -9,7 +9,7 @@ import { pathToFileURL } from 'node:url'
 
 const pluginRoot = resolve(import.meta.dirname, '..') // Current AdminSmart Harness plugin package root.
 const projectRoot = resolve(pluginRoot, '..', '..') // Shared multi-project root containing plugins and the pinned npm runtime project.
-const harnessRoot = resolve(process.env.ADMINSMART_DSH_TEST_ROOT || resolve(projectRoot, 'deepseek-harness-runtime')) // 兼容性测试可指定隔离候选安装，不替换正式共享库。
+const harnessRoot = resolve(process.env.ADMINSMART_DSH_TEST_ROOT || process.env.ADMINSMART_DSH_ROOT || resolve(projectRoot, 'deepseek-harness-runtime')) // 候选安装和显式Runtime根优先，不静默验证旧共享库。
 const runtimeRequire = createRequire(resolve(harnessRoot, 'package.json')) // Package resolver anchored at the exact shared npm dependency tree.
 const loadRuntimeModule = async moduleName => await import(pathToFileURL(runtimeRequire.resolve(moduleName)).href) // Resolve the same built packages used by production Harness.
 
@@ -36,6 +36,8 @@ const { default: AgentPreset } = await loadRuntimeModule('@deepseek-ai/dsh-agent
 const { default: AgentPresetRegistry } = await loadRuntimeModule('@deepseek-ai/dsh-agent-preset-registry') // Official service that resolves and mounts a registered preset into an Agent scope.
 const { default: SubagentRuntime } = await loadRuntimeModule('@deepseek-ai/dsh-subagent') // 原生委派依赖，测试不启动模型。
 const SpawnInProcess = await loadRuntimeModule('@deepseek-ai/dsh-subagent-spawn-in-process') // stock 同进程 provider，不自行实现子代理。
+const { default: WorkingDirectory } = await loadRuntimeModule('@deepseek-ai/dsh-working-directory') // 官方alpha2子激活依赖的会话目录服务。
+const { default: LocalFileSystem } = await loadRuntimeModule('@deepseek-ai/dsh-fs-local') // 只验证本测试合成临时目录，不访问业务文件。
 
 const temporaryRoot = await mkdtemp(join(tmpdir(), 'aurasearch-preset-registration-')) // Isolated preset root removed after the assertion.
 process.env.DSH_HOME = temporaryRoot // Guard 的状态只能来自当前测试隔离目录。
@@ -68,7 +70,7 @@ try {
   await context.plugin(SessionStore)
   await context.plugin(SystemPrompt, { persona: '' })
   await context.plugin(ToolRuntime)
-  context.provide('fs', {}) // 文件执行在独立路径测试覆盖，本测试不得打开真实文件。
+  await context.plugin(LocalFileSystem, { cwd: temporaryRoot }) // 真实工作目录校验只使用本测试root；文件工具越权仍由Guard拒绝。
   context.provide('sandboxPolicy', { defaultMode: 'workspace-write', resolve: () => ({ mode: 'workspace-write', workspaceRoot: temporaryRoot }) })
   context.provide('shellEnv', { collect: () => ({}) })
   context.provide('shell', { sandboxMode: 'workspace-write', resolve() { throw new Error('离线装配不得执行命令') } })
@@ -97,6 +99,7 @@ try {
   })
   await context.plugin(AgentRegistry)
   await context.plugin(SessionProjectionRegistry)
+  await context.plugin(WorkingDirectory, { defaultDirectory: temporaryRoot })
   await context.plugin(SubagentRuntime, { maxDepth: 1, maxActiveSubagents: 2 })
   await context.plugin(SpawnInProcess, { providerName: 'spawn' })
   await context.plugin(AgentLoop, { agents: [] })
@@ -131,10 +134,14 @@ try {
   await writeFile(join(temporaryRoot, '.adminsmart-state/session-web-access.json'), JSON.stringify({
     version: 1,
     sessions: { [handle.agent.id]: { enabled: false, updatedAt: Date.now() } },
-  })) // 与 UI Host 持久化同一协议，模拟用户关闭联网。
-  assert.equal((await execute('web_fetch', { url: 'https://example.test/source' })).isError, true)
-  assert.equal(searchCalls, 0, '关闭联网后不得调用 Harness WebSearchProvider')
-  assert.equal(fetchCalls, 1, '关闭后不得再次到达网页 Provider')
+  })) // 只生成退役偏好的合成历史，验证不迁移或删除数据也不会遗留禁网状态。
+  assert.equal((await execute('web_fetch', { url: 'https://example.test/source' })).isError, false)
+  assert.equal((await execute('web_search', { queries: ['public fixture'] })).isError, false)
+  assert.equal(searchCalls, 1, '旧关闭偏好不再阻止官方WebSearchProvider')
+  assert.equal(fetchCalls, 2, '旧关闭偏好不再阻止官方网页Provider')
+  await writeFile(join(temporaryRoot, '.adminsmart-state/session-web-access.json'), 'invalid legacy state')
+  assert.equal((await execute('web_fetch', { url: 'https://example.test/source' })).isError, false)
+  assert.equal(fetchCalls, 3, '损坏的退役文件也不能改变当前官方能力')
   const preparation = await agentEvents(context, handle.agent).waterfall(
     'agent/pre-step',
     { agent: handle.agent, messages: [], turn: 1, step: 1, signal: new AbortController().signal }, // 官方 pre-step 事件必须携带当前 Agent，时钟插件才能读取对应 Session 投影。

@@ -2,7 +2,16 @@
 
 const GENERAL_NAMES = Object.freeze(['locale', 'ui-theme', 'ui-chat', 'ui-conversation', 'ui-settings']) // 五个官方展示命名空间，排除供应商、凭据与权限设置。
 const OWNED_SETTINGS_NAMESPACE = 'adminsmart-shared-settings' // 官方 ui-settings 停用后，独立自有 wrapper entry 的唯一公开身份。
-const POLICY_FIELDS = Object.freeze(['locale', 'theme', 'fontSize', 'transcriptView', 'performanceUsage', 'developerTools', 'busyEnter', 'linkOpening']) // 既有 API 的八个稳定字段；响应不能扩大白名单。
+const POLICY_FIELDS = Object.freeze([
+  'locale',
+  'theme',
+  'fontSize',
+  'transcriptView',
+  'performanceUsage',
+  'developerTools',
+  'busyEnter',
+  'linkOpening',
+]) // 既有 API 的八个稳定字段；响应不能扩大白名单。
 const LOCALE_PATTERN = /^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/u // RC2 官方 Locale Config 允许的语言标签。
 const TRANSCRIPT_VALUES = new Set(['compact', 'standard', 'detailed', 'verbose', 'normal', 'expanded', null]) // RC2 当前模式、兼容旧值与未指定状态；完全展开是 verbose。
 const REFRESH_MS = 30_000 // 推送暂不可用时的低频完整回读，正常更新由内部失效事件立即驱动。
@@ -14,23 +23,37 @@ const EVENT_BUFFER_LIMIT = 16_384 // SSE 只承载类型和修订，拒绝无限
 /**
  * 解析内部 SSE 的有限失效消息，不接受设置正文、身份或任意事件类型。
  * @param {string} frame 一个已分离的标准 SSE 帧。
- * @returns {object|null} ready/resync 恢复信号或 general/shortcuts 的正整数修订；注释帧返回 null。
+ * @returns {object|null} ready/resync 恢复信号或 general/shortcuts/native/models 的正整数修订；注释帧返回 null。
  * @throws {Error} 格式损坏、额外字段或任意未知载荷，不将其转交业务写入。
  */
 export function parseUiPolicyEvent(frame) {
   const lines = frame.split('\n') // 标准 SSE 字段逐行解析，不解释任意脚本或配置。
-  const name = lines.find(line => line.startsWith('event:'))?.slice(6).trim() // 后端固定事件类型，不作为路径或设置命名空间。
+  const name = lines
+    .find((line) => line.startsWith('event:'))
+    ?.slice(6)
+    .trim() // 后端固定事件类型，不作为路径或设置命名空间。
   if (!name) return null
   if (name === 'unavailable') throw new Error('界面设置实时分发暂不可用')
   if (!['ready', 'resync', 'policy-invalidated'].includes(name)) throw new Error('界面设置实时分发消息无效')
-  const payload = JSON.parse(lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n')) // 未校验载荷不能进入设置回读与修订基线。
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('界面设置实时分发消息无效')
+  const payload = JSON.parse(
+    lines
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trimStart())
+      .join('\n'),
+  ) // 未校验载荷不能进入设置回读与修订基线。
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload))
+    throw new Error('界面设置实时分发消息无效')
   if (name !== 'policy-invalidated') {
     if (Object.keys(payload).length !== 0) throw new Error('界面设置实时分发消息无效')
     return { kind: null, revision: null } // 恢复信号只触发完整回读，不携带策略数据。
   }
-  if (Object.keys(payload).length !== 2 || !['general', 'shortcuts'].includes(payload.kind)
-    || !Number.isSafeInteger(payload.revision) || payload.revision < 1) throw new Error('界面设置实时分发消息无效')
+  if (
+    Object.keys(payload).length !== 2 ||
+    !['general', 'shortcuts', 'native', 'models'].includes(payload.kind) ||
+    !Number.isSafeInteger(payload.revision) ||
+    payload.revision < 1
+  )
+    throw new Error('界面设置实时分发消息无效')
   return payload
 }
 
@@ -38,10 +61,18 @@ export function parseUiPolicyEvent(frame) {
  * 订阅当前签名 Runtime 的内部 General 失效流；数据库 GET 仍是设置真源。
  * @param {object} options Gateway 提供的固定 apiBase/readToken/userId/modeId/presetId，与策略 GET 共用身份。
  * @param {(event: object) => Promise<void>|void} onEvent 合法恢复信号或新修订触发的受控回读。
+ * @param {object} [subscription] 已批准的单类订阅与可隔离传输。
+ * @param {string} [subscription.kind=general] 只消费该类独立修订，其他合法类别静默忽略。
+ * @param {Function} [subscription.fetchImpl] 固定路径的传输替身，不接收用户指定URL。
  * @returns {() => void} 中止当前流与重连计时器，卸载后不会发起迟到请求。
  * @sideEffects 仅调用固定内部只读 SSE，每次连接重新读取令牌；没有浏览器凭据或公开 SSE。
  */
-export function watchUiPolicyEvents(options, onEvent) {
+export function watchUiPolicyEvents(
+  options,
+  onEvent,
+  { kind = 'general', fetchImpl = globalThis.fetch } = {},
+) {
+  if (!['general', 'shortcuts', 'native', 'models'].includes(kind)) throw new Error('界面设置订阅类别无效') // 固定受限类别，不能变成任意消息分发。
   let disposed = false // 官方 Host 卸载后不再重连或回调。
   let controller = null // 当前 SSE 的 AbortController，由卸载和有界超时共同释放。
   let reconnectTimer = null // 一次连接结束只计划一个后续连接。
@@ -57,7 +88,7 @@ export function watchUiPolicyEvents(options, onEvent) {
     try {
       const token = await options.readToken() // 签名能力仅存在 Host 调用栈，每次重连读取当前受保护文件。
       if (disposed || active.signal.aborted) return
-      const response = await fetch(`${options.apiBase}/internal/agent-model/v1/ui-policy/events`, {
+      const response = await fetchImpl(`${options.apiBase}/internal/agent-model/v1/ui-policy/events`, {
         method: 'GET', // 普通用户只读订阅，不能借此提交设置。
         redirect: 'error', // 认证能力不得重定向到其它服务。
         headers: {
@@ -82,7 +113,7 @@ export function watchUiPolicyEvents(options, onEvent) {
           const event = parseUiPolicyEvent(buffer.slice(0, separator)) // 消息必须经过有限结构验证。
           buffer = buffer.slice(separator + 2)
           if (event?.kind === null) await onEvent(event)
-          else if (event?.kind === 'general' && event.revision > confirmedRevision) {
+          else if (event?.kind === kind && event.revision > confirmedRevision) {
             confirmedRevision = event.revision
             await onEvent(event)
           }
@@ -95,7 +126,10 @@ export function watchUiPolicyEvents(options, onEvent) {
       clearTimeout(timeout)
       if (controller === active) controller = null
       if (!disposed) {
-        reconnectTimer = setTimeout(() => { reconnectTimer = null; void connect() }, EVENT_RECONNECT_MS)
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null
+          void connect()
+        }, EVENT_RECONNECT_MS)
         reconnectTimer.unref?.()
       }
     }
@@ -116,17 +150,23 @@ export function watchUiPolicyEvents(options, onEvent) {
  * @sideEffects 无；null transcript 保留官方客户端默认语义。
  */
 function isGeneralPolicy(policy) {
-  return policy !== null && typeof policy === 'object' && !Array.isArray(policy)
-    && Object.keys(policy).length === POLICY_FIELDS.length
-    && POLICY_FIELDS.every(field => Object.hasOwn(policy, field))
-    && (policy.locale === null || typeof policy.locale === 'string' && LOCALE_PATTERN.test(policy.locale))
-    && ['light', 'dark', 'system'].includes(policy.theme)
-    && Number.isInteger(policy.fontSize) && policy.fontSize >= 10 && policy.fontSize <= 22
-    && TRANSCRIPT_VALUES.has(policy.transcriptView)
-    && ['compact', 'detailed'].includes(policy.performanceUsage)
-    && typeof policy.developerTools === 'boolean'
-    && ['queue', 'steer'].includes(policy.busyEnter)
-    && ['sidebar', 'new-tab'].includes(policy.linkOpening)
+  return (
+    policy !== null &&
+    typeof policy === 'object' &&
+    !Array.isArray(policy) &&
+    Object.keys(policy).length === POLICY_FIELDS.length &&
+    POLICY_FIELDS.every((field) => Object.hasOwn(policy, field)) &&
+    (policy.locale === null || (typeof policy.locale === 'string' && LOCALE_PATTERN.test(policy.locale))) &&
+    ['light', 'dark', 'system'].includes(policy.theme) &&
+    Number.isInteger(policy.fontSize) &&
+    policy.fontSize >= 10 &&
+    policy.fontSize <= 22 &&
+    TRANSCRIPT_VALUES.has(policy.transcriptView) &&
+    ['compact', 'detailed'].includes(policy.performanceUsage) &&
+    typeof policy.developerTools === 'boolean' &&
+    ['queue', 'steer'].includes(policy.busyEnter) &&
+    ['sidebar', 'new-tab'].includes(policy.linkOpening)
+  )
 }
 
 /**
@@ -136,7 +176,10 @@ function isGeneralPolicy(policy) {
  * @returns {boolean} 八项持久化偏好是否一致；旧值与 null 不被改写。
  */
 function samePolicy(left, right) {
-  return left === right || left !== null && right !== null && POLICY_FIELDS.every(field => left[field] === right[field])
+  return (
+    left === right ||
+    (left !== null && right !== null && POLICY_FIELDS.every((field) => left[field] === right[field]))
+  )
 }
 
 /**
@@ -153,17 +196,24 @@ function canonicalGeneralNamespace(namespace) {
 /**
  * 读取五个原生展示命名空间的官方实时描述。
  * @param {object} settings 官方 SettingsForms 服务。
+ * @param {'light'|'dark'|'system'} [historicalTheme='light'] 已确认兼容记录的历史主题，不从当前用户偏好推断。
  * @returns {Map<string, object>} canonical 白名单命名空间到完整描述的映射，保留原生修订号及真实 sourceNamespace。
  * @sideEffects describe 可能发布官方 document-updated 事件；不访问原始 Profile 或凭据。
  */
 function generalRows(settings) {
-  return new Map(settings.describe({ redactSecrets: true })
-    .filter(row => GENERAL_NAMES.includes(canonicalGeneralNamespace(row.ns)))
-    .map(row => [canonicalGeneralNamespace(row.ns), {
-      ...row, // 原样保留官方 Schema、有效值、继承层和修订，不访问任何私有状态。
-      ns: canonicalGeneralNamespace(row.ns), // 捕获和既有八字段策略继续使用 canonical General 协议。
-      sourceNamespace: String(row.ns), // 原生 update/mutate 必须写实际 entry ID，不能向已停用旧 entry 写入。
-    }]))
+  return new Map(
+    settings
+      .describe({ redactSecrets: true })
+      .filter((row) => GENERAL_NAMES.includes(canonicalGeneralNamespace(row.ns)))
+      .map((row) => [
+        canonicalGeneralNamespace(row.ns),
+        {
+          ...row, // 原样保留官方 Schema、有效值、继承层和修订，不访问任何私有状态。
+          ns: canonicalGeneralNamespace(row.ns), // 捕获和既有八字段策略继续使用 canonical General 协议。
+          sourceNamespace: String(row.ns), // 原生 update/mutate 必须写实际 entry ID，不能向已停用旧 entry 写入。
+        },
+      ]),
+  )
 }
 
 /**
@@ -172,9 +222,9 @@ function generalRows(settings) {
  * @returns {object|null} 八项完整展示设置；命名空间未就绪或必需值损坏时返回 null，等待下一次同步。
  * @sideEffects 仅读取；语言与 transcript 未指定时用 null 表达，而不是写入默认语言或模式。
  */
-export function captureGeneralSettings(settings) {
+export function captureGeneralSettings(settings, historicalTheme = 'light') {
   const rows = generalRows(settings) // 官方有效值已解析 Schema 与继承配置，不从 Profile 原文取值。
-  if (GENERAL_NAMES.some(name => !rows.has(name))) return null
+  if (GENERAL_NAMES.some((name) => !rows.has(name))) return null
   const locale = rows.get('locale').value // 未指定语言由官方客户端选择浏览器语言。
   const theme = rows.get('ui-theme').value // 外观偏好与整数像素字号的官方属主。
   const chat = rows.get('ui-chat').value // 工作细节、性能统计与链接目的地的官方属主。
@@ -182,7 +232,7 @@ export function captureGeneralSettings(settings) {
   const general = rows.get('ui-settings').value // 诊断工具开关的官方属主。
   const policy = {
     locale: locale?.preference ?? null, // null 保留未指定语言，不使用已解析的显示语言。
-    theme: theme?.preference, // system 是可持久化偏好，不替换成当前 light/dark。
+    theme: historicalTheme, // 历史兼容字段仅保留已确认记录，个人明暗不能发布成全站策略。
     fontSize: theme?.fontSize, // 采用实际生效字号，不强制回到官方默认字号。
     transcriptView: chat?.transcriptView ?? null, // RC2 未指定时交给官方 Client；旧值保持原样。
     performanceUsage: chat?.performanceUsage, // 完整保留 compact/detailed。
@@ -204,30 +254,42 @@ export function captureGeneralSettings(settings) {
 export async function applyGeneralSettings(settings, policy) {
   if (!isGeneralPolicy(policy)) throw new Error('全局智能体界面设置无效')
   const rows = generalRows(settings) // 读值与原生修订号必须来自同一次官方描述。
-  if (GENERAL_NAMES.some(name => !rows.has(name))) throw new Error('通用设置尚未就绪')
+  if (GENERAL_NAMES.some((name) => !rows.has(name))) throw new Error('通用设置尚未就绪')
   const updates = [
-    ['ui-theme', {
-      preference: policy.theme, // 官方外观字段，不接受自定义主题代码。
-      fontSize: policy.fontSize, // 官方整数像素字号。
-    }],
-    ['ui-chat', {
-      transcriptView: policy.transcriptView, // 保留官方当前模式、兼容旧值与 null 未指定状态。
-      performanceUsage: policy.performanceUsage, // 性能统计明细级别。
-      linkOpening: policy.linkOpening, // 外部链接目的地。
-    }],
+    [
+      'ui-theme',
+      {
+        fontSize: policy.fontSize, // 官方整数像素字号。
+      },
+    ],
+    [
+      'ui-chat',
+      {
+        transcriptView: policy.transcriptView, // 保留官方当前模式、兼容旧值与 null 未指定状态。
+        performanceUsage: policy.performanceUsage, // 性能统计明细级别。
+        linkOpening: policy.linkOpening, // 外部链接目的地。
+      },
+    ],
     ['ui-conversation', { busyEnter: policy.busyEnter }], // 官方忙碌 Enter 字段。
     ['ui-settings', { enabled: policy.developerTools }], // 官方诊断工具字段。
   ] // 固定命名空间与字段白名单，不按响应动态生成任意 Profile 写入口。
   const locale = rows.get('locale') // Locale 的官方 unset 会恢复未指定/继承语义。
   if (policy.locale === null) {
-    if (locale.value?.preference !== undefined) await settings.mutate('locale', [{ op: 'unset', path: ['preference'] }], locale.revision)
+    if (locale.value?.preference !== undefined)
+      await settings.mutate('locale', [{ op: 'unset', path: ['preference'] }], locale.revision)
   } else if (locale.value?.preference !== policy.locale) {
     await settings.update('locale', { preference: policy.locale }, locale.revision)
   }
   // name 是目标命名空间；fields 是该命名空间固定的展示字段白名单。
   for (const [name, fields] of updates) {
     const current = rows.get(name) // 官方描述可能包含未来其它字段，不能整段替换。
-    if (Object.entries(fields).every(([field, value]) => (field === 'transcriptView' ? current.value?.[field] ?? null : current.value?.[field]) === value)) continue
+    if (
+      Object.entries(fields).every(
+        ([field, value]) =>
+          (field === 'transcriptView' ? (current.value?.[field] ?? null) : current.value?.[field]) === value,
+      )
+    )
+      continue
     await settings.update(current.sourceNamespace ?? name, fields, current.revision)
   }
 }
@@ -242,7 +304,7 @@ export async function applyGeneralSettings(settings, policy) {
  * @param {string} options.modeId 服务端白名单业务模式。
  * @param {string} options.presetId 服务端选定的 Agent Preset。
  * @param {boolean} options.isAdmin 签名租约中的管理员角色，只有严格 true 才允许发布。
- * @returns {void} effect 管理定时器与事件订阅。
+ * @returns {object} effect 管理定时器与事件订阅；getBootstrapSnapshot仅返回当前完整采用的确认副本。
  * @sideEffects 普通用户仅 GET 与本地采用；管理员通过既有受权 PUT 发布，失败不记录响应正文。
  */
 export function installSharedUiPolicy(ctx, options) {
@@ -286,8 +348,14 @@ export function installSharedUiPolicy(ctx, options) {
       throw error
     }
     const payload = await response.json() // 未校验数据不能进入原生写操作或同步基线。
-    if (!payload || !Number.isSafeInteger(payload.revision) || payload.revision < 0
-      || (payload.settings === null ? payload.revision !== 0 : payload.revision < 1 || !isGeneralPolicy(payload.settings))) {
+    if (
+      !payload ||
+      !Number.isSafeInteger(payload.revision) ||
+      payload.revision < 0 ||
+      (payload.settings === null
+        ? payload.revision !== 0
+        : payload.revision < 1 || !isGeneralPolicy(payload.settings))
+    ) {
       throw new Error('全局智能体界面设置响应无效')
     }
     return payload
@@ -299,13 +367,13 @@ export function installSharedUiPolicy(ctx, options) {
    * @returns {Promise<void>} 全部原生字段已采用，确认基线同步推进。
    * @throws {Error} 原生写入失败或有效值与目标不一致，保留下次完整采用标记。
    */
-  const adopt = async remote => {
+  const adopt = async (remote) => {
     mustAdopt = true
     applying = true
     try {
       await applyGeneralSettings(ctx.settings, remote.settings)
       if (disposed) return
-      const adopted = captureGeneralSettings(ctx.settings) // 官方 unset 可能恢复继承值，必须验证实际采用结果。
+      const adopted = captureGeneralSettings(ctx.settings, remote.settings.theme) // 历史主题不参与个人采用；其它共享字段必须完整验证。
       if (!samePolicy(adopted, remote.settings)) throw new Error('通用设置尚未完整采用')
       lastConfirmed = remote
       mustAdopt = false
@@ -321,12 +389,15 @@ export function installSharedUiPolicy(ctx, options) {
    */
   const reconcile = async () => {
     if (disposed) return
-    if (running) { rerun = true; return }
+    if (running) {
+      rerun = true
+      return
+    }
     running = true
     try {
       const remote = await request('GET') // 后端持久化状态决定跨用户及 Runtime 重启后的展示策略。
       if (disposed) return
-      const local = captureGeneralSettings(ctx.settings) // 只比较完整且合法的官方有效值。
+      const local = captureGeneralSettings(ctx.settings, remote.settings?.theme ?? lastConfirmed?.settings?.theme ?? 'light') // 仅把已确认历史主题带回兼容契约，不读取个人颜色形成全站修改。
       if (local === null) return // 等待下次定时回读，不用默认值填补，也不形成微任务忙循环。
       if (!initialized) {
         if (remote.settings !== null) {
@@ -340,8 +411,10 @@ export function installSharedUiPolicy(ctx, options) {
         initialized = true
         return
       }
-      const localChanged = lastConfirmed !== null && lastConfirmed.settings !== null
-        && !samePolicy(local, lastConfirmed.settings) // 官方事件遗漏时，定时比较仍能识别真实编辑。
+      const localChanged =
+        lastConfirmed !== null &&
+        lastConfirmed.settings !== null &&
+        !samePolicy(local, lastConfirmed.settings) // 官方事件遗漏时，定时比较仍能识别真实编辑。
       if (admin && !mustAdopt && localChanged && !samePolicy(local, remote.settings)) {
         if (remote.revision !== lastConfirmed.revision) {
           if (remote.settings !== null) await adopt(remote) // GET 已发现另一管理员更新，旧编辑不能冒用新修订覆盖它。
@@ -362,17 +435,29 @@ export function installSharedUiPolicy(ctx, options) {
       if (!disposed) ctx.logger?.warn?.('AdminSmart 全局界面设置同步暂不可用') // 不记录策略正文、内部异常或能力令牌。
     } finally {
       running = false
-      if (rerun && !disposed) { rerun = false; queueMicrotask(() => { void reconcile() }) }
+      if (rerun && !disposed) {
+        rerun = false
+        queueMicrotask(() => {
+          void reconcile()
+        })
+      }
     }
   }
 
   ctx.effect(() => {
-    const unsubscribe = admin ? ctx.on('settings/document-updated', ns => {
-      if (!initialized || applying || !GENERAL_NAMES.includes(canonicalGeneralNamespace(ns))) return
-      if (wakeTimer !== null) clearTimeout(wakeTimer)
-      wakeTimer = setTimeout(() => { wakeTimer = null; void reconcile() }, 200)
-    }) : () => {} // ns 是官方变化命名空间，普通 Runtime 不订阅出站发布事件。
-    const interval = setInterval(() => { void reconcile() }, REFRESH_MS) // 活跃 Session 周期采用共享策略，不随渲染频繁请求。
+    const unsubscribe = admin
+      ? ctx.on('settings/document-updated', (ns) => {
+          if (!initialized || applying || !GENERAL_NAMES.includes(canonicalGeneralNamespace(ns))) return
+          if (wakeTimer !== null) clearTimeout(wakeTimer)
+          wakeTimer = setTimeout(() => {
+            wakeTimer = null
+            void reconcile()
+          }, 200)
+        })
+      : () => {} // ns 是官方变化命名空间，普通 Runtime 不订阅出站发布事件。
+    const interval = setInterval(() => {
+      void reconcile()
+    }, REFRESH_MS) // 活跃 Session 周期采用共享策略，不随渲染频繁请求。
     interval.unref?.()
     const releaseEvents = watchUiPolicyEvents(options, () => reconcile()) // commit 后 Redis 失效消息立即触发 GET/官方采用，不等待低频补偿时钟。
     void reconcile()
@@ -384,4 +469,22 @@ export function installSharedUiPolicy(ctx, options) {
       if (wakeTimer !== null) clearTimeout(wakeTimer)
     }
   }, 'adminsmart-client-ui: shared General settings')
+  return {
+    /**
+     * 读取可用于当前HTML首次装配的已采用策略，不启动网络、不缓存额外副本。
+     * @returns {object|null} 已确认的revision/settings/writable；未初始化、部分采用、冲突、卸载或现值偏离时返回null。
+     * @sideEffects 只通过公开SettingsForms捕获当前安全General值；其首次describe可能发布官方描述事件。
+     */
+    getBootstrapSnapshot() {
+      if (disposed || !initialized || applying || mustAdopt || !lastConfirmed?.settings) return null
+      try {
+        if (!isGeneralPolicy(lastConfirmed.settings) || !samePolicy(captureGeneralSettings(ctx.settings, lastConfirmed.settings.theme), lastConfirmed.settings)) return null
+        return {
+          revision: lastConfirmed.revision, // 已实际采用或持久化确认的General独立CAS修订。
+          settings: structuredClone(lastConfirmed.settings), // 分离副本避免HTML构建修改当前确认真源。
+          writable: admin, // 角色只来自Gateway可信装配，bootstrap稍后仍与官方控制器能力求交集。
+        }
+      } catch { return null } // 官方描述不可用时回退既有HTTP确认，不把错误或部分设置注入页面。
+    },
+  }
 }

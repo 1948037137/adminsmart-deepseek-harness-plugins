@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
 
 const runtimeRoot = path.resolve(process.env.ADMINSMART_DSH_ROOT || fileURLToPath(new URL('../../../deepseek-harness-runtime/', import.meta.url))) // 与受管服务相同的共享固定版本，不加载私有测试副本。
+const profileFixturePath = process.env.ADMINSMART_DSH_PROFILE_FIXTURE || fileURLToPath(new URL('../../adminsmart-harness-platform/profiles/adminsmart-web/cordis.patch.yml', import.meta.url)) // 隔离镜像可显式引用只读候选 Profile；正式仓库沿用相邻受管 Profile，不复制私有运行状态。
 
 /** 仅提供 SDK 初始化和样式安装所需的离线节点能力，不渲染页面或启动浏览器。 */
 class ElementFixture extends EventTarget {
@@ -119,6 +120,7 @@ test('真实 Cordis 同步激活普通用户语音依赖，管理员导航不被
       name: 'adminsmart-voice-dependency-fixture',
       apply(child) {
         const result = client.apply({ // 自有 Client 不得把依赖注册推迟到网络响应或未等待的 effect。
+          inject: () => () => {}, // 本测试不装配个人主题服务，依赖保持pending。
           reflect: child.reflect, // 服务提供与释放保留真实 Cordis 生命周期。
           theme: { getTheme: () => ({ preference: 'light', colorScheme: 'light' }) }, // 其它界面 effect 不在本测试范围。
           slots: { inject: () => () => {} }, // 不挂载实际界面，不影响依赖检查。
@@ -145,29 +147,28 @@ test('真实 Cordis 同步激活普通用户语音依赖，管理员导航不被
   }
 })
 
-test('AdminSmart consumes icon exports that exist in the fixed official primitives seed', () => {
+test('业务退出按钮只消费固定官方Primitives，品牌位置不再导入图形', () => {
   const primitives = official.seeds['@deepseek-ai/dsh-client-ui-primitives'] // Current Web platform seed, not the permissive bundle-test Fake.
+  const clientSource = readFileSync(fileURLToPath(new URL('../lib/client.js', import.meta.url)), 'utf8') // 手机退出只使用当前官方按钮，不继续要求退役联网或页面覆盖的Primitive。
   for (const name of [
-    'IconCheckOutlineRegular', 'IconChecklistOutlineRegular', 'IconChevronLeftOutlineRegular',
-    'IconCloseFillRegular', 'IconCloseOutlineRegular', 'IconEditOutlineRegular',
-    'IconEllipsisOutlineRegular', 'IconNewChatOutlineRegular', 'IconGlobeOutlineRegular',
-    'IconPanelLeftOutlineRegular', 'IconSearchOutlineRegular', 'IconTrashOutlineRegular',
-    'IconChevronDownOutlineRegular', 'IconMicrophoneOutlineRegular',
-    'IconSettingsOutlineRegular', 'IconRefreshOutlineRegular', 'IconStopFillRegular',
-    'IconPlusOutlineRegular', 'IconRefreshOutlineRegular', 'Input', 'Modal'
-  ]) assert.ok(
-    typeof primitives?.[name] === 'function'
-      || primitives?.[name] !== null && typeof primitives?.[name] === 'object',
-    `${name} must exist in the official Web seed`
-  )
+    'Button',
+  ]) {
+    assert.ok(clientSource.includes(name), `${name} must be consumed by the actual Client`)
+    assert.ok(
+      typeof primitives?.[name] === 'function'
+        || primitives?.[name] !== null && typeof primitives?.[name] === 'object',
+      `${name} must exist in the official Web seed`
+    )
+  }
+  assert.doesNotMatch(clientSource, /IconSparkleMedium|aurasearch-logo|jsx\('img'/u)
 })
 
-test('public model inputs keep the official primitive as the sole border owner', () => {
+test('official Models keep the native Input border without a business input replacement', () => {
   const nativeCss = readFileSync(path.join(runtimeRoot, 'node_modules/@deepseek-ai/dsh-client-ui-primitives/lib/Input.module.css'), 'utf8') // 固定 Harness Input 外壳持有唯一边框。
   const clientSource = readFileSync(fileURLToPath(new URL('../lib/client.js', import.meta.url)), 'utf8') // 自有样式只能约束外壳宽度。
   assert.match(nativeCss, /\.wrap\s*\{[^}]*border:\s*0\.5px solid/u)
   assert.match(nativeCss, /\.input\s*\{[^}]*border:\s*none/u)
-  assert.doesNotMatch(clientSource, /\.adminsmart-public-models__input\s+input\s*\{/u)
+  assert.doesNotMatch(clientSource, /adminsmart-public-models/u)
 })
 
 /** @returns {object} 声明官方 Header、品牌和 Hero 品牌 Slot 的独立离线上下文。 */
@@ -175,6 +176,9 @@ function nativeHeaderFixture() {
   const ctx = new official.seeds['@deepseek-ai/cordis'].Context() // 不启动 Host、Session、模型或业务服务。
   new official.SlotRegistry(ctx)
   const nativeHeader = () => null // 只用于确认原始 Header 注册身份仍被保留。
+  const nativeSidebar = () => null // 授权品牌内容不能接管官方侧栏父节点或点击行为。
+  const nativeBrandMark = () => null // 官方默认品牌必须保留在公开账本中。
+  const nativeBrandName = () => null // 官方默认品牌名称保持独立内容所有者。
   ctx.slots.register({ name: 'root', children: {
     'conversation.session.header': { kind: 'single', scope: 'session' },
     sidebar: { kind: 'single', scope: 'root' },
@@ -194,8 +198,11 @@ function nativeHeaderFixture() {
   ctx.slots.register({ name: 'sidebar', children: {
     'sidebar.brand.mark': { kind: 'single', scope: 'root' },
     'sidebar.brand.name': { kind: 'single', scope: 'root' },
-  } }, () => null)
-  return { ctx, nativeHeader }
+    'sidebar.footer.action': { kind: 'list', scope: 'root' },
+  } }, nativeSidebar)
+  ctx.slots.register({ name: 'sidebar.brand.mark' }, nativeBrandMark)
+  ctx.slots.register({ name: 'sidebar.brand.name' }, nativeBrandName)
+  return { ctx, nativeHeader, nativeSidebar, nativeBrandMark, nativeBrandName }
 }
 
 test('real official SlotRegistry rejects the duplicate Header child declaration from the reported regression', async () => {
@@ -207,154 +214,76 @@ test('real official SlotRegistry rejects the duplicate Header child declaration 
   } finally { await ctx.fiber.dispose() }
 })
 
-test('the actual AdminSmart plugin keeps the native Header and fills official AuraSearch brand Slots', async () => {
-  const { ctx, nativeHeader } = nativeHeaderFixture() // 原始声明保持真实，自有插件必须在此基础上加载成功。
+test('the actual AdminSmart plugin preserves native Header/sidebar and contributes only brand plus mobile logout list entries', async () => {
+  const { ctx, nativeHeader, nativeSidebar, nativeBrandMark, nativeBrandName } = nativeHeaderFixture() // 原始声明和组件身份保持真实；品牌占位和业务退出只进入各自公开席位。
   const document = documentFixture() // 只捕获插件样式，不执行浏览器页面或框架 Hook。
-  const client = readFactory(fileURLToPath(new URL('../lib/client.js', import.meta.url)), document)(key => official.seeds[key]) // 执行实际交付的自有 Client 包。
+  const client = readFactory(fileURLToPath(new URL('../lib/client.js', import.meta.url)), document)(key => key === 'react' || key === 'react/jsx-runtime' ? runtimeRequire(key) : official.seeds[key]) // 实际交付包的React接到相同固定SDK的SSR实例，真实Hook只在组件渲染中调用。
   try {
     assert.doesNotThrow(() => client.apply({ theme: { getTheme: () => ({ preference: 'light', colorScheme: 'light' }) }, effect: () => () => {}, slots: ctx.slots, inject: () => () => {} }))
     assert.equal(ctx.slots.entries('conversation.session.header').length, 1)
     assert.equal(ctx.slots.entries('conversation.session.header')[0].component, nativeHeader)
-    assert.equal(ctx.slots.entries('sidebar.brand.mark').length, 1)
-    assert.equal(ctx.slots.entries('sidebar.brand.name').length, 1)
-    assert.deepEqual(ctx.slots.entries('shell.overlay').map(entry => entry.options.id), ['adminsmart-mobile-sidebar'])
+    assert.equal(ctx.slots.entries('sidebar').length, 1)
+    assert.strictEqual(ctx.slots.entries('sidebar')[0].component, nativeSidebar)
+    const logoutHeader = ctx.slots.entries('conversation.session.header.utilities') // 手机退出通过list追加，绝不覆盖右侧栏corner单占位。
+    const logoutSidebar = ctx.slots.entries('sidebar.footer.action') // 官方blank Session隐藏utilities，root侧栏保留退出兜底。
+    assert.equal(logoutHeader.length, 1)
+    assert.equal(logoutHeader[0].options.id, 'adminsmart-mobile-logout')
+    assert.equal(logoutSidebar.length, 1)
+    assert.strictEqual(logoutSidebar[0].component, logoutHeader[0].component)
+    assert.deepEqual(ctx.slots.entries('conversation.session.header.corner'), [])
+    for (const [name, original] of [['sidebar.brand.mark', nativeBrandMark], ['sidebar.brand.name', nativeBrandName]]) {
+      const entries = ctx.slots.entries(name) // 原始默认和业务品牌并存，不删除或重声明父席位。
+      assert.equal(entries.length, 2)
+      assert.equal(entries.filter(entry => entry.component === original).length, 1)
+      const brand = entries.find(entry => entry.component !== original) // 唯一授权内容必须通过公开优先级赢得选择。
+      assert.equal(brand.options.priority, -1)
+      assert.strictEqual(ctx.slots.entriesOfSlot(name)[0].component, brand.component)
+    }
+    assert.deepEqual(ctx.slots.entries('shell.overlay'), [])
     assert.equal(ctx.slots.entries('conversation.hero.brand.mark').length, 1)
+    const heroBrand = ctx.slots.entriesOfSlot('conversation.hero.brand.mark')[0] // 真实官方single选择独立Hero席位，不覆盖Conversation父组件。
+    const sidebarBrand = ctx.slots.entriesOfSlot('sidebar.brand.mark')[0] // 收起及展开sidebar共用同一公开mark组件。
+    assert.notStrictEqual(heroBrand.component, sidebarBrand.component)
+    assert.equal(sidebarBrand.component({ size: 24 }), null, '展开及收起侧栏都不显示品牌图形')
+    assert.equal(ctx.slots.entriesOfSlot('sidebar.brand.name')[0].component({}).props.children, 'AuraSearch')
+    const { renderToStaticMarkup } = runtimeRequire('react-dom/server') // 含Hook的Hero组件必须通过真实React渲染，不直接调用函数绕过生命周期。
+    const markup = renderToStaticMarkup(runtimeRequire('react').createElement(heroBrand.component, { size: 34 })) // passiveEffect不在SSR执行，DOM交互由独立JSDOM回归覆盖。
+    assert.match(markup, /<span\b[^>]*hidden=""[^>]*data-adminsmart-hero-presentation="v1"[^>]*aria-hidden="true"/u)
+    assert.doesNotMatch(markup, /<svg\b|<img\b/u)
+    assert.equal(markup.replace(/<[^>]*>/gu, '').trim(), '')
     assert.deepEqual(
       ctx.slots.entries('settings.plugins.tab').map(entry => ({ id: entry.options.id, order: entry.options.order, label: entry.options.label?.() })),
       [],
     )
-    assert.deepEqual(ctx.slots.entries('settings.models.provider-card').map(entry => entry.options.key).sort(), ['llm-deepseek', 'llm-pi-ai'])
-    const css = document.head.children.find(node => node.tagName === 'STYLE')?.textContent // 官方 Header 不再被自有样式隐藏。
+    assert.deepEqual(ctx.slots.entries('settings.models.provider-card'), [])
+    const css = document.head.children.find(node => node.tagName === 'STYLE')?.textContent ?? '' // 无业务样式同样合法，官方Header不得被任何残留自有CSS隐藏。
     assert.doesNotMatch(css, /\[data-slot="conversation\.session\.header"\]\s*\{\s*display: none !important;/)
   } finally { await ctx.fiber.dispose() }
 })
 
-test('local and public administrators mount the same managed Models section once', async () => {
-  const settingsSource = readFileSync(path.join(runtimeRoot, 'node_modules/@deepseek-ai/dsh-client-ui-settings-general/lib/client.js'), 'utf8') // 固定版官方导航读取原始 Slot 条目。
-  const platformSource = readFileSync(fileURLToPath(new URL('../../adminsmart-harness-platform/profiles/adminsmart-web/cordis.patch.yml', import.meta.url)), 'utf8') // 两个环境都停用原生 Models 设置页。
-  assert.match(settingsSource, /ctx\.slots\.entries\("settings\.section"\)\.map/u)
-  assert.match(platformSource, /- id: ui-settings-models\s+disabled: true/u)
+test('all origins keep official Models without custom provider cards or reasoning selection overrides', async () => {
+  const source = readFileSync(fileURLToPath(new URL('../lib/client.js', import.meta.url)), 'utf8') // 实际自有 Bundle，不能保留退役第二套供应商页面。
+  const platformSource = readFileSync(profileFixturePath, 'utf8') // 角色来自验签 Runtime，不能按 hostname 分叉；镜像测试读取调用方明确指定的只读候选。
+  assert.match(platformSource, /- id: ui-settings-models\s+disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"\s+config:\s+#[^\n]*\s+credentialOnboarding: false/u)
+  assert.match(platformSource, /- id: client-hmr\s+disabled: false/u)
+  assert.match(platformSource, /- id: ui-brand-official\s+disabled: false/u)
+  assert.doesNotMatch(source, /AdminSmartManagedModelsSection|requestAdminModelDiscovery|ADMIN_MODELS_DISCOVER_URL|AdminSmartProviderPolicy|AdminSmartPrivateReasoning|AdminSmartModelConfiguration|MODEL_REASONING_URL|MODEL_DEFAULTS_URL|modelDirectories|requestModelPreference/u)
   for (const hostname of ['localhost', 'www.example.test']) {
-    const { ctx } = nativeHeaderFixture() // 每个来源独立注册一次相同的插件页面。
+    const { ctx } = nativeHeaderFixture() // 与实际官方 SlotRegistry 相同的公开账本。
+    const nativeModels = () => null // 官方 Models 的原席位，在两种顺序都必须唯一保留。
+    ctx.slots.register({ name: 'settings.section', id: 'models', order: 10 }, nativeModels)
     const client = readFactory(fileURLToPath(new URL('../lib/client.js', import.meta.url)), documentFixture(), { hostname })(key => official.seeds[key])
     try {
-      client.apply({ theme: { getTheme: () => ({ preference: 'light', colorScheme: 'light' }) }, effect: () => () => {}, slots: ctx.slots, inject: () => () => {} })
-      const entries = ctx.slots.entries('settings.section').filter(entry => entry.options.id === 'models') // 官方导航读取原始列表，两个环境均只能有一项。
-      assert.equal(entries.length, 1, hostname)
-      assert.equal(entries[0].component.name, 'AdminSmartManagedModelsSection', hostname)
-      assert.equal(entries[0].options.label?.(), '模型')
+      client.apply({ inject: () => () => {}, effect: () => () => {}, slots: ctx.slots })
+      const entries = ctx.slots.entries('settings.section').filter(entry => entry.options.id === 'models') // 自有应用只能补增量，不能替换官方Models。
+      assert.equal(entries.length, 1)
+      assert.strictEqual(entries[0].component, nativeModels)
+      assert.deepEqual(ctx.slots.entries('settings.models.provider-card'), [])
     } finally { await ctx.fiber.dispose() }
   }
 })
 
-test('stale native Models profiles cannot block client boot during a rolling restart', async () => {
-  const pluginPath = fileURLToPath(new URL('../lib/client.js', import.meta.url)) // 当前交付 Client，不模拟另一份业务实现。
-  for (const nativeFirst of [true, false]) {
-    const { ctx } = nativeHeaderFixture() // 两种合法 Loader 挂载顺序各使用独立官方 SlotRegistry。
-    const nativeModels = () => null // 旧用户 Runtime 中仍启用的官方 Models 页面。
-    if (nativeFirst) ctx.slots.register({ name: 'settings.section', id: 'models', order: 10 }, nativeModels)
-    const client = readFactory(pluginPath, documentFixture(), { hostname: 'localhost' })(key => official.seeds[key])
-    try {
-      assert.doesNotThrow(() => client.apply({ theme: { getTheme: () => ({ preference: 'light', colorScheme: 'light' }) }, effect: () => () => {}, slots: ctx.slots, inject: () => () => {} }))
-      if (!nativeFirst) assert.doesNotThrow(() => ctx.slots.register({ name: 'settings.section', id: 'models', order: 10 }, nativeModels))
-      const entries = ctx.slots.entries('settings.section').filter(entry => entry.options.id === 'models') // 过渡期可有两个不同优先级账本项，但不能启动失败。
-      assert.equal(entries.length, nativeFirst ? 1 : 2)
-      if (nativeFirst) assert.equal(entries[0].component, nativeModels) // 已在运行的旧页不被中途切走。
-    } finally { await ctx.fiber.dispose() }
-  }
-})
-
-test('public Models renders native-style provider cards and an in-place editor', async () => {
-  const provider = {
-    routeId: 'fixture-gpt', fingerprint: 'a'.repeat(64), displayName: 'GPT',
-    api: 'openai-responses', baseURL: 'https://models.example.test/v1', credentialConfigured: true,
-    models: [{ id: 'gpt-6-sol', name: 'GPT-6 Sol', contextWindow: 128000, maxTokens: 8192, input: ['text'] }],
-  } // 只含非敏感模型元数据的管理员目录替身。
-  const renderPage = async draft => {
-    const { ctx } = nativeHeaderFixture() // 每轮渲染独立注册同一官方 Slot，避免测试之间复用账本。
-    let index = 0 // 将当前页面已确认状态注入原组件，其它状态保持初始值。
-    const states = [{ status: 'ready', providers: [provider], error: '' }, draft] // 列表和展开表单各渲染一次。
-    const reactServer = runtimeRequire('react') // 只供本项结构测试渲染基础 DOM，不替换生产 React。
-    const react = {
-      ...official.seeds.react,
-      useState(initial) { const value = index < states.length ? states[index] : initial; index += 1; return [value, () => {}] },
-      useEffect() {},
-      useRef() { return { current: null } },
-    } // 服务端离线渲染不启动请求或浏览器 effect。
-    const primitiveFixture = {
-      ...official.seeds['@deepseek-ai/dsh-client-ui-primitives'],
-      Button: ({ icon, children, variant: _variant, size: _size, ...props }) => reactServer.createElement('button', props, icon, children),
-      Input: ({ icon: _icon, ...props }) => reactServer.createElement('input', props),
-      Menu: ({ anchor }) => anchor,
-      Modal: ({ open }) => open ? reactServer.createElement('div') : null,
-    } // 原语真实导出另有契约测试；此处只隔离 bundled React 的服务端 Hook dispatcher。
-    const client = readFactory(fileURLToPath(new URL('../lib/client.js', import.meta.url)), documentFixture(), { hostname: 'www.example.test' })(key => {
-      if (key === 'react') return react
-      if (key === '@deepseek-ai/dsh-client-ui-primitives') return primitiveFixture
-      return official.seeds[key]
-    })
-    try {
-      client.apply({ theme: { getTheme: () => ({ preference: 'light', colorScheme: 'light' }) }, effect: () => () => {}, slots: ctx.slots, inject: () => () => {} })
-      const section = ctx.slots.entriesOfSlot('settings.section').find(entry => entry.options.id === 'models')?.component // 公网唯一的 Models 页面。
-      return runtimeRequire('react-dom/server').renderToStaticMarkup(reactServer.createElement(section))
-    } finally { await ctx.fiber.dispose() }
-  }
-  const cards = await renderPage(null)
-  assert.match(cards, /adminsmart-public-models__provider-card/u)
-  assert.match(cards, /GPT-6 Sol|配置思考等级/u)
-  assert.match(cards, /正在读取模型/u, '模型用途面板不应藏在思考配置折叠区内')
-  assert.match(cards, /密钥已配置/u)
-  const editor = await renderPage({
-    routeId: provider.routeId, fingerprint: provider.fingerprint, displayName: provider.displayName,
-    api: provider.api, baseURL: provider.baseURL, apiKey: '',
-    models: [{ id: 'gpt-6-sol', name: 'GPT-6 Sol', contextWindow: '128000', maxTokens: '8192', input: ['text'] }],
-  })
-  assert.match(editor, /adminsmart-public-models__form/u)
-  assert.match(editor, /已配置，输入新值可替换/u)
-  assert.match(editor, /获取可用模型/u)
-})
-
-test('candidate selection survives a deferred React state update after the browser event is released', async () => {
-  const { ctx } = nativeHeaderFixture() // 只调用页面组件的渲染函数，不向浏览器或供应商发请求。
-  const selectedState = { open: true, status: 'ready', models: [{ id: 'gpt-6-sol', name: 'GPT-6 Sol' }], selected: [], error: '' } // 已返回的单个候选。
-  const snapshots = [
-    { status: 'ready', providers: [], error: '' }, // 已加载的管理员 Provider 目录。
-    { routeId: 'gpt', fingerprint: 'a'.repeat(64), displayName: 'GPT', api: 'openai-responses', baseURL: 'https://models.example.test/v1', apiKey: '', models: [] }, // 当前编辑草稿。
-    false, '', false, true, '', -1, selectedState,
-  ] // 与组件 useState 声明顺序对应的离线快照。
-  const deferredUpdates = [] // React 可能在浏览器事件释放之后才执行此函数式更新。
-  let stateIndex = 0 // 区分候选选择状态的 setter，其它状态不提交。
-  const react = {
-    ...official.seeds.react,
-    useState(initial) {
-      const index = stateIndex++
-      return [index < snapshots.length ? snapshots[index] : initial, update => { if (index === 8) deferredUpdates.push(update) }]
-    },
-    useEffect() {},
-    useRef() { return { current: null } },
-  } // 保留实际 JSX 树，仅延后 React 的候选状态提交。
-  const client = readFactory(fileURLToPath(new URL('../lib/client.js', import.meta.url)), documentFixture(), { hostname: 'www.example.test' })(key => key === 'react' ? react : official.seeds[key])
-  try {
-    client.apply({ theme: { getTheme: () => ({ preference: 'light', colorScheme: 'light' }) }, effect: () => () => {}, slots: ctx.slots, inject: () => () => {} })
-    const section = ctx.slots.entriesOfSlot('settings.section').find(entry => entry.options.id === 'models')?.component // 实际公网 Models 组件。
-    const tree = section() // Hook 由本测试的受控状态替身提供。
-    const findCandidateCheckbox = node => {
-      if (!node || typeof node !== 'object') return null
-      if (Array.isArray(node)) return node.map(findCandidateCheckbox).find(Boolean) ?? null
-      if (node.type === 'input' && node.props?.type === 'checkbox' && node.props?.disabled === false) return node
-      return findCandidateCheckbox(node.props?.children)
-    } // 只查当前发现弹窗的真实 input 事件回调。
-    const checkbox = findCandidateCheckbox(tree) // 当前候选项未在 Provider 草稿中，应该可勾选。
-    assert.ok(checkbox)
-    const event = { currentTarget: { checked: true } } // React 事件对象只在回调同步阶段有效。
-    checkbox.props.onChange(event)
-    event.currentTarget = null // 模拟 React 延后执行函数式更新时释放 currentTarget。
-    assert.equal(deferredUpdates.length, 1)
-    assert.deepEqual(Array.from(deferredUpdates[0](selectedState).selected), ['gpt-6-sol'])
-  } finally { await ctx.fiber.dispose() }
-})
-
-test('the actual SlotRegistry shadows only the official developer notice without removing Models', async () => {
+test('the actual SlotRegistry preserves official onboarding without a business replacement', async () => {
   const { ctx } = nativeHeaderFixture() // Same fixed-version registry used by the Web Client.
   const officialModelsSource = readFileSync(path.join(runtimeRoot, 'node_modules/@deepseek-ai/dsh-client-ui-settings-models/lib/client.js'), 'utf8') // Fixed official bundle owns the notice cell being shadowed.
   assert.match(officialModelsSource, /name: "settings\.onboarding",\s+id: "welcome-notice",\s+order: -100/) // If upstream changes its ID, the product must re-evaluate this public Slot composition.
@@ -366,10 +295,8 @@ test('the actual SlotRegistry shadows only the official developer notice without
     client.apply({ theme: { getTheme: () => ({ preference: 'light', colorScheme: 'light' }) }, effect: () => () => {}, slots: ctx.slots, inject: () => () => {} })
     const entries = ctx.slots.entries('settings.onboarding').filter(entry => entry.options.id === 'welcome-notice') // Raw ledger retains both compatible contributions.
     const winner = ctx.slots.entriesOfSlot('settings.onboarding').find(entry => entry.options.id === 'welcome-notice') // Renderer uses the lower-priority public contribution.
-    assert.equal(entries.length, 2)
-    assert.equal(winner?.options.priority, -1)
-    assert.notEqual(winner?.component, officialWelcome)
-    assert.throws(() => ctx.slots.register({ name: 'settings.onboarding', id: 'welcome-notice', priority: -1 }, () => null), /welcome-notice.*already|already.*welcome-notice/)
+    assert.equal(entries.length, 1)
+    assert.strictEqual(winner?.component, officialWelcome)
   } finally { await ctx.fiber.dispose() }
 })
 
@@ -385,7 +312,7 @@ test('the official voice Bundle alone owns the microphone and waveform Slot', as
   const client = readFactory(fileURLToPath(new URL('../lib/client.js', import.meta.url)), document)(key => official.seeds[key])
   const officialSource = readFileSync(path.join(runtimeRoot, 'node_modules/@deepseek-ai/dsh-experimental-client-ui-voice-input/lib/client.js'), 'utf8') // 固定发布包的官方 VoiceInput 与 Waveform 真实组成。
   try {
-    client.apply({ theme: { getTheme: () => ({ preference: 'light', colorScheme: 'light' }) }, effect: () => () => {}, slots: ctx.slots })
+    client.apply({ inject: () => () => {}, theme: { getTheme: () => ({ preference: 'light', colorScheme: 'light' }) }, effect: () => () => {}, slots: ctx.slots })
     assert.equal(ctx.slots.entries('conversation.input.activity').length, 1)
     assert.equal(ctx.slots.entriesOfSlot('conversation.input.activity')[0]?.component, officialVoice)
     assert.match(officialSource, /conversation\.input\.activity/)

@@ -70,14 +70,14 @@ test('render selection refuses commands, output paths, permissions and ambiguous
   assert.deepEqual(renderSelection({ file_path: 'report.pdf' }).pages, [1])
   assert.deepEqual(renderSelection({ file_path: 'report.pdf', pages: [1], sheet: '', range: '' }).pages, [1], '真实模型会补齐可选空字段，不能误判正常 PDF 调用')
   assert.throws(() => renderSelection({ file_path: 'report.pdf', pages: [1], sheet: 'Sales', range: '' }))
-  assert.throws(() => renderSelection({ file_path: 'report.pdf', pages: [] }))
+  assert.deepEqual(renderSelection({ file_path: 'report.pdf', pages: [] }).pages, [1], '官方技能的空可选页码仍只渲染第一页')
   assert.throws(() => renderSelection({ file_path: 'report.pdf', pages: [1, 1] }))
   assert.throws(() => renderSelection({ file_path: 'report.pdf', pages: [1, 2, 3, 4] }))
   assert.throws(() => renderSelection({ file_path: 'report.pdf', pages: [-1] }))
   for (const property of ['command', 'outputDir', 'output_path', 'sandbox_permissions', 'userId', 'sessionId', 'code']) assert.throws(() => renderSelection({ file_path: 'report.pdf', [property]: 'forged' }))
   assert.throws(() => renderSelection({ file_path: 'report.docm' }))
   assert.throws(() => renderSelection({ file_path: 'report.xlsx', pages: [1] }))
-  assert.throws(() => renderSelection({ file_path: 'report.xlsx' }))
+  assert.match(renderSelection({ file_path: 'report.xlsx' }).skippedReason, /实际工作表/)
   assert.throws(() => renderSelection({ file_path: 'report.xlsx', sheet: 'Sales', range: 'A1;whoami' }))
   assert.equal(renderSelection({ file_path: 'report.xlsx', sheet: 'Sales', range: 'A1:D12' }).range, 'A1:D12')
   assert.equal(renderSelection({ file_path: 'report.xlsx', pages: [], sheet: 'Sales', range: '' }).sheet, 'Sales', '表格的可选空页码只表示未选择物理页，不扩大处理范围')
@@ -101,8 +101,9 @@ test('a current accepted attachment uses the official byte stream and leaves ori
   const f = await fixture(t) // 原件在业务 cwd 外，但当前会话引用明确授权只读。
   const reference = { attachmentId: 'sha256:' + createHash('sha256').update(f.bytes).digest('hex'), name: 'own.pdf', bytes: f.bytes.length } // 完全合成的原生文件身份。
   f.events.push({ type: 'user/message', data: { content: [{ type: 'file', attachment: reference }] } })
-  assert.equal(authorizedRenderSource(f.ctx, { ...f.exec, arguments: { file_path: f.outside } }).reference, reference)
+  assert.deepEqual(authorizedRenderSource(f.ctx, { ...f.exec, arguments: { file_path: f.outside } }).reference, reference)
   const result = await createDocumentRenderer(fakeFactory())(f.ctx, { file_path: f.outside }, f.exec)
+  assert.equal(result.status, 'ready')
   assert.equal(result.fileName, 'own.pdf')
   assert.deepEqual(f.reads, ['attachment'])
   assert.ok(result.images[0].path.startsWith(f.root))
@@ -110,6 +111,29 @@ test('a current accepted attachment uses the official byte stream and leaves ori
   assert.equal(jobs.length, 1)
   assert.deepEqual(await readdir(join(f.root, jobs[0])), ['pages'], '成功后不保留输入副本')
   assert.deepEqual(await readFile(f.outside), f.bytes)
+})
+
+test('Session目录切换后受控渲染与路径Guard使用同一个相对文件，不能误取业务根同名文件', async t => {
+  const f = await fixture(t) // 所有同名文件和区外canary均由本项生成。
+  const directory = join(f.root, 'worktree') // 合成Session已切换的业务子目录，不创建真实Git检出。
+  const currentInput = join(directory, 'fixture.pdf') // 与业务根原件同名，内容必须可以区分。
+  const currentBytes = Buffer.concat([f.bytes, Buffer.from('\n% SYNTHETIC-CURRENT-SESSION\n')]) // 合成PDF增加可区分的末尾注释，不含真实文档。
+  await mkdir(directory)
+  await writeFile(currentInput, currentBytes)
+  let currentDirectory = directory // 仅由可信公开工作目录服务的Fixture改变，工具参数不能覆盖。
+  f.ctx.get = name => name === 'workingDirectory' ? { get: () => currentDirectory } : undefined // 只替换外围目录数据，实际授权、快照和render管道仍运行。
+  const source = authorizedRenderSource(f.ctx, { ...f.exec, arguments: { file_path: 'fixture.pdf', pages: [1] } }) // 同名文件不能以根目录作为第二套基准。
+  assert.equal(source.path, currentInput)
+  assert.equal((await createDocumentRenderer(fakeFactory())(f.ctx, { file_path: 'fixture.pdf', pages: [1] }, f.exec)).status, 'ready')
+  assert.deepEqual(f.reads, [currentInput])
+  assert.deepEqual(await readFile(currentInput), currentBytes)
+  assert.deepEqual(await readFile(f.input), f.bytes)
+  await symlink(f.outside, join(directory, 'escape.pdf'), 'file') // 当前Session子目录内的链接仍只能指向授权业务文件，区外自建canary不可借链接读取。
+  assert.throws(() => authorizedRenderSource(f.ctx, { ...f.exec, arguments: { file_path: 'escape.pdf', pages: [1] } }), /不属于业务目录或当前会话附件/u)
+  assert.deepEqual(f.reads, [currentInput]) // 拒绝发生在快照与引擎之前，不读取链接目标字节。
+  currentDirectory = f.temporary // 即便绝对输入仍在业务根，当前Session目录越界时不得借此跳过Guard。
+  assert.throws(() => authorizedRenderSource(f.ctx, { ...f.exec, arguments: { file_path: f.input, pages: [1] } }), /不属于业务目录或当前会话附件/u)
+  assert.deepEqual(f.reads, [currentInput])
 })
 
 test('cancellation, failed engines and tampered output settle disposal without publishing partial pages', async t => {
@@ -148,6 +172,26 @@ test('one Runtime render slot refuses overlap and is released after engine compl
   assert.equal((await render(f.ctx, { file_path: f.input }, f.exec)).images.length, 1)
 })
 
+test('official Office default requests return explicit skipped without another rendering pipeline', async t => {
+  const f = await fixture(t) // 全部输入在本测试自己的业务根，不能读取生产文件。
+  const workbook = join(f.root, 'fixture.xlsx') // 只测试范围准入，不声称此固定字节是可解析工作簿。
+  await writeFile(workbook, 'synthetic-no-render')
+  let engines = 0 // 无sheet的默认调用不读取源、不启动任何渲染引擎。
+  const render = createDocumentRenderer(async () => { engines += 1; throw Object.assign(new Error('fixture unavailable'), { code: 'unavailable' }) }) // Fake只验证官方引擎不可用状态传播。
+  const defaultWorkbook = await render(f.ctx, { file_path: workbook, pages: [], sheet: '', range: '' }, f.exec) // 模拟官方技能无页码默认请求。
+  assert.equal(defaultWorkbook.status, 'skipped')
+  assert.deepEqual(defaultWorkbook.images, [])
+  assert.equal(defaultWorkbook.pageCount, 0)
+  assert.equal(engines, 0)
+  assert.deepEqual(f.reads, [])
+  const unavailable = await render(f.ctx, { file_path: f.input }, f.exec) // 授权PDF可以读源，但明确缺引擎不伪造ready。
+  assert.equal(unavailable.status, 'skipped')
+  assert.equal(unavailable.backend, 'unavailable')
+  assert.deepEqual(unavailable.images, [])
+  assert.match(unavailable.note, /没有视觉核验/)
+  assert.equal((await readdir(f.root)).filter(name => name.startsWith('office-render-')).length, 0)
+})
+
 test('oversized attachment metadata fails before byte access and forged engine output cannot escape', async t => {
   const f = await fixture(t) // 所有越界对象只在本测试临时目录内。
   let engines = 0 // 超限请求不得启动官方高权限渲染器。
@@ -173,9 +217,10 @@ test('the fixed official engine renders real PDF pixels and native Tool rejects 
   process.env.ADMINSMART_AGENT_BUSINESS_ROOT = business
   f.context.sandboxPolicy.resolve = () => ({ mode: 'workspace-write', workspaceRoot: business })
   const parent = await f.parent('official-render-parent') // 附件权限来源于真实官方已接受消息。
+  await f.context.workingDirectory.set(parent, business) // 真实Session cwd与本用例缩小后的业务根一致，不凭env模拟目录切换。
   const original = syntheticRenderPdf() // 真实页面像素文件完全由测试生成。
   const reference = await f.context.attachments.saveFile({ name: 'render-fixture.pdf', data: original }) // 正式 Store 保存并校验内容身份。
-  parent.followup(llmModule.createUserMessage({ content: [{ type: 'file', attachment: reference }] }))
+  parent.followup(llmModule.createUserMessage({ source: { kind: 'user' }, content: [{ type: 'file', attachment: reference }] })) // 官方用户来源让附件通过真实会话消息持久化。
   await parent.whenIdle()
   const path = f.context.attachments.fileHostPath(reference) // 不硬编码官方内部存储布局。
   assert.doesNotThrow(() => authorizedRenderSource(f.context, { agent: parent, arguments: { file_path: path, pages: [1] } }))
@@ -197,6 +242,7 @@ test('the fixed official engine renders real PDF pixels and native Tool rejects 
   const denied = await f.execute(parent, 'render_document', { file_path: path, pages: [1], sandbox_permissions: 'danger-full-access' }) // Schema 未声明的字段仍由业务 Guard 拒绝。
   assert.equal(denied.isError, true)
   const stranger = await f.parent('official-render-stranger') // 同一 Runtime 另一个没有附件引用的真实会话。
+  await f.context.workingDirectory.set(stranger, business) // 拒绝必须来自缺少本会话附件授权，不能被无关cwd越界提前替代。
   assert.equal((await f.execute(stranger, 'render_document', { file_path: path, pages: [1] })).isError, true)
   const runtimeRoot = (await import('../src/runtime.mjs')).runtimeRoot // 部署同一安装树，用来定位已有合成文档生成依赖。
   const python = process.env.ADMINSMART_OFFICE_PYTHON || resolve(runtimeRoot, '../智能体后端/.venv/Scripts/python.exe') // 仅测试读取已配置解释器，不新增或下载依赖。
@@ -204,7 +250,7 @@ test('the fixed official engine renders real PDF pixels and native Tool rejects 
   for (const fileName of ['render-word.docx', 'render-sales.xlsx']) {
     const officeBytes = await readFile(join(f.home, fileName)) // 全部由上面的 Fixture 生成，不读取用户文件。
     const officeReference = await f.context.attachments.saveFile({ name: fileName, data: officeBytes }) // 两类 Office 都走真实官方附件存储。
-    parent.followup(llmModule.createUserMessage({ content: [{ type: 'file', attachment: officeReference }] }))
+    parent.followup(llmModule.createUserMessage({ source: { kind: 'user' }, content: [{ type: 'file', attachment: officeReference }] })) // 只提交本测试生成的办公附件。
     await parent.whenIdle()
     const selection = fileName.endsWith('.xlsx') ? { pages: [], sheet: 'Sales', range: 'A1:B3' } : { pages: [1], sheet: '', range: '' } // 按真实模型完整参数形状测试两种选择语义。
     const officeResult = await f.execute(parent, 'render_document', { file_path: f.context.attachments.fileHostPath(officeReference), ...selection })
@@ -220,4 +266,5 @@ test('the fixed official engine renders real PDF pixels and native Tool rejects 
     return [{ type: 'text', text: 'synthetic authorized parent page only' }]
   }
   assert.equal((await f.execute(parent, 'subagent', { description: 'synthetic page fixture', prompt: 'render the authorized parent page only' })).isError, false)
+  await f.settle(parent)
 })

@@ -1,4 +1,4 @@
-import { realpathSync, statSync } from 'node:fs'
+import { realpathSync, statSync, readFileSync } from 'node:fs'
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { runtimeRoot } from './runtime.mjs'
 import { sessionFiles } from './session-files.mjs'
@@ -17,6 +17,35 @@ export function businessRoot() {
 export function within(root, candidate) {
   const delta = relative(root, candidate) // 使用系统路径语义，不采用字符串前缀判断兄弟目录。
   return delta === '' || (!isAbsolute(delta) && delta !== '..' && !delta.startsWith(`..${sep}`))
+}
+
+/**
+ * Git工作树只能来自当前业务根内可确认的仓库，不能沿Git的祖先发现读取外部仓库。
+ * @param {object} ctx 当前官方工作目录服务。
+ * @param {object} execution 可信live Agent的官方调用。
+ * @returns {string|undefined} 目录或仓库边界不明时拒绝；Git操作和创建仍由原SDK执行。
+ */
+export function worktreeExecutionDenial(ctx, execution) {
+  try {
+    const root = canonical(businessRoot()) // 原用户业务根，不因选中Worktree扩大。
+    let directory = canonical(resolve(ctx.get?.('workingDirectory')?.get(execution.agent?.session) ?? root)) // 当前已提交Session cwd，模型不能替换。
+    if (!within(root, directory)) return 'Git工作树来源必须位于当前业务目录'
+    for (;;) {
+      const marker = resolve(directory, '.git') // 只在已授权祖先内查仓库身份，不运行git或扫描外部目录。
+      try {
+        const info = statSync(marker) // 现存仓库标记，链接仍必须经canonical回到业务根。
+        if (!within(root, canonical(marker))) return 'Git仓库元数据超出当前业务范围'
+        if (info.isDirectory()) return undefined
+        if (!info.isFile() || info.size > 4096) return 'Git仓库归属暂时无法确认'
+        const declaration = readFileSync(marker, 'utf8').trim() // 官方linked checkout的有限gitdir声明，不读取用户文档。
+        const match = /^gitdir: ([^\r\n\0]+)$/u.exec(declaration) // 仅确认元数据路径归属，不自行实现Git解析或检出。
+        if (!match || !within(root, canonical(resolve(directory, match[1])))) return 'Git仓库元数据超出当前业务范围'
+        return undefined
+      } catch (error) { if (error.code !== 'ENOENT') throw error }
+      if (directory === root) return '当前业务目录内没有可用Git仓库，请在已授权仓库中使用工作树'
+      directory = dirname(directory)
+    }
+  } catch { return 'Git工作树来源或业务目录权限无法确认' }
 }
 
 /**
@@ -46,7 +75,16 @@ export function permitsPath(ctx, execution, value, write = false) {
   if (typeof value !== 'string' || !value.trim() || /[\0\r\n]/u.test(value) || /^\\\\|^\/\/|^[A-Za-z]+:\/\//u.test(value)) return false
   if (process.platform === 'win32' && value.replace(/^[A-Za-z]:/u, '').includes(':')) return false
   const root = canonical(businessRoot()) // 每次读取真实根，路径链接变化不能复用旧字符串授权。
-  const candidate = canonical(resolve(root, value)) // 相对路径始终从受管业务根解析。
+  const currentDirectory = ctx.get?.('workingDirectory')?.get(execution.agent?.session) ?? root // 官方已提交的Session目录是相对路径基准，不接受模型另传身份。
+  const current = canonical(resolve(currentDirectory)) // Worktree切换后仍须位于原用户业务根，目录本身不能扩大授权。
+  if (!within(root, current)) return false
+  const candidate = canonical(resolve(current, value)) // 与官方文件工具实际使用的Session cwd一致，防止检查与执行定位不同文件。
+  if (execution.agent?.session) {
+    for (const reference of sessionFiles(execution.agent.session, ctx.sessionProjections).values()) {
+      const source = reference.mediaType ? ctx.attachments.imageHostPath(reference) : ctx.attachments.fileHostPath(reference) // 只有当前会话已接受的引用可经官方 Store 计算原件位置。
+      if (source && canonical(source) === candidate) return !write // 官方原件即使位于业务根内也只读；允许其内容寻址硬链接，不能把任意同 inode 别名当附件。
+    }
+  }
   if (within(root, candidate)) {
     try {
       const entry = statSync(candidate) // 硬链接没有可确认的唯一文件归属，普通文件工具不能据路径授权。
@@ -59,10 +97,6 @@ export function permitsPath(ctx, execution, value, write = false) {
   if (write) return false
   const assets = canonical(resolve(runtimeRoot, 'node_modules/@deepseek-ai/dsh-skill-office/assets')) // 仅官方办公技能目录可作为只读资源。
   if (within(assets, candidate)) return true
-  for (const reference of sessionFiles(execution.agent?.session).values()) {
-    const source = reference.mediaType ? ctx.attachments.imageHostPath(reference) : ctx.attachments.fileHostPath(reference) // 来源必须由官方 Store 从已授权引用计算。
-    if (source && canonical(source) === candidate) return true
-  }
   return false
 }
 
@@ -95,7 +129,10 @@ export function nativeExecutionDenial(ctx, execution) {
       const policy = ctx.sandboxPolicy.resolve({ session: execution.agent.session }) // 官方会话沙箱状态不能被隐藏的历史覆盖放宽。
       const root = canonical(businessRoot()) // 已批准的业务根，不接受模型改变权限根。
       if (policy.mode !== 'workspace-write' || canonical(resolve(policy.workspaceRoot)) !== root) return '当前会话的写入沙箱不属于受管业务目录'
-      const cwd = canonical(resolve(root, args.workdir || '.')) // 允许业务根内子目录，不允许通过工作目录绕到其它位置。
+      const currentDirectory = ctx.get?.('workingDirectory')?.get(execution.agent.session) ?? root // 命令与文件工具共同使用官方提交的Session cwd。
+      const current = canonical(resolve(currentDirectory)) // 原业务根保持写入边界，切换目录不能扩大权限。
+      if (!within(root, current)) return '当前会话工作目录不属于业务范围'
+      const cwd = canonical(resolve(current, args.workdir || '.')) // Worktree内相对命令目录仍受同一业务根和真实路径约束。
       return within(root, cwd) ? undefined : '命令工作目录必须位于当前业务目录'
     }
     return undefined

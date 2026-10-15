@@ -118,7 +118,7 @@ test('普通用户已打开Runtime立即采用管理员新策略，不等待任�
   state.remote = { revision: 2, settings: changed }
   state.streams[0].emit('event: policy-invalidated\ndata: {"kind":"general","revision":2}\n\n')
   await flush()
-  assert.deepEqual(captureGeneralSettings(ctx.settings), changed)
+  assert.deepEqual(captureGeneralSettings(ctx.settings, changed.theme), changed)
   assert.equal(state.calls.filter(call => call.method === 'PUT').length, 0)
   const reads = state.calls.filter(call => !call.url.endsWith('/events')).length // 已完成回读数，用于验证乱序/重复事件被合并。
   state.streams[0].emit('event: policy-invalidated\ndata: {"kind":"general","revision":2}\n\nevent: policy-invalidated\ndata: {"kind":"general","revision":1}\n\n')

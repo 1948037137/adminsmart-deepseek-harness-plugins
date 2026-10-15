@@ -1,4 +1,4 @@
-# AdminSmart 固定 Harness 0.2.1-alpha.1 Web Runtime Profile。
+# AdminSmart 固定 Harness 0.2.1-alpha.3 Web Runtime Profile；对应官方发行包候选，切换运行安装需发布验收。
 # 本文件只组装跨业务共享能力；知识库等业务提示词和工具归 Agent Preset 插件所有。
 
 # 管理员私有官方 Provider Profile 初始为空；开发与生产均由同一受管插件页面编辑。
@@ -15,7 +15,7 @@
   config:
     mode: native
 
-# 官方调度器最多并行两个 Tool；知识 Preset 的单次委派复用原生 Agent Loop。
+# 官方调度器继承模板默认并行两个 Tool；管理员共享覆盖使用官方合法范围，子会话激活及结果通知仍由官方生命周期管理。
 - id: agent-loop
   config:
     maxParallelToolCalls: 2
@@ -119,6 +119,8 @@
               enableRunInBackground: false
           - id: skill-office
             name: '@deepseek-ai/dsh-skill-office'
+            config:
+              cli: false # 子会话继承同样的受控官方渲染入口，不开放模型可自行定位的 CLI。
           - id: tool-skill
             name: '@deepseek-ai/dsh-tool-skill'
           - id: present
@@ -185,11 +187,11 @@
 - id: skill-filesystem
   disabled: true
 
-# PTC 与 Workflow 代码执行链依赖 ctx.fs；知识 Agent 明确不挂载代码执行、
-# 任意文件系统或 Workflow Tool，因此必须在 Profile 层整体关闭，避免只关 UI
-# 后仍让后台服务等待缺失的 fs 能力并产生 pending/ERR_MODULE_NOT_FOUND。
+# 官方 Ralph 组合需要根 PTC service。管理员预备该官方服务以支持公开 Bundle
+# 实时启停；是否向模型开放 Ralph 仍由管理员角色、真实组合与 Agent Guard 共同决定。
+# 普通用户不装载高权限组合且保持该服务关闭；根 Workflow Tool 仍独立禁用。
 - id: ptc-runtime
-  disabled: true
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
 
 - id: workflow-ptc
   disabled: true
@@ -251,13 +253,31 @@
 - id: tool-pwsh
   disabled: true
 
-# 官方 Settings、插件清单和插件管理 Host/API 只对可信管理员 Runtime 挂载；
-# 非管理员即使绕过页面也不会拥有对应 Remote 服务。
-- id: settings-controller
-  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+# 管理员使用官方配置与受管管理 Remote；普通角色只读采用共享配置，
+# 受管插件管理服务在服务端拒绝普通用户所有外部管理调用。
+# Workspace 和 Session 原始控制器由同 Runtime 的受管公开继承提供；不双注册 Remote。
+# 仅限制 trusted cwd/root Workspace 的创建删除，原始模型选择、查询、命令与会话生命周期继续由官方处理。
+- id: workspace-controller
+  disabled: true
 
+- id: session-controller
+  disabled: true
+
+- id: settings-controller
+  disabled: true
+
+# 原始控制器由自有窄策略继承后，仍显式装载官方完整 RPC Schema；不降级成缺少可选参数校验的 SRC 反射。
+- id: typert-loader
+  config:
+    packages:
+      - '@deepseek-ai/dsh-api-settings-controller'
+      - '@deepseek-ai/dsh-plugin-manager'
+      - '@deepseek-ai/dsh-api-workspace-controller'
+      - '@deepseek-ai/dsh-api-session-controller'
+
+# 官方管理类由权限/共享 Adapter 继承装配；它保持原生目录与生命周期，避免重复注册 Remote。
 - id: plugin-manager
-  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+  disabled: true
 
 - id: plugin-inventory
   disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
@@ -290,6 +310,10 @@
 # ui-settings-general 同时拥有设置入口与 settings.open 快捷键，仅在签名管理员 Runtime 注册。
 
 # 官方快捷键引擎继续处理按键；参考页和 Mod+/ 编辑入口仅属于签名管理员。
+# 官方实时模块推送处理已确认的插件启停；运行产物由 Gateway 启动时冻结，开发编辑不会热更生产代码。
+- id: client-hmr
+  disabled: false
+
 - id: ui-shortcuts
   disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
 
@@ -297,7 +321,10 @@
   disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
 
 - id: ui-settings-models
-  disabled: true
+  disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
+  config:
+    # 管理员已有受管模型配置，避免首屏自动凭据引导读取目录；手动打开官方 Models 页面仍按需加载。
+    credentialOnboarding: false
 
 # 历史 RC2 引入的官方子代理模型选择管理在当前固定版继续属于管理员面，普通用户只继承父模型。
 - id: ui-settings-subagent
@@ -309,8 +336,13 @@
 - id: ui-plugin-manager
   disabled: !!js "process.env.ADMINSMART_AGENT_IS_ADMIN !== '1'"
 
-# 官方品牌由 AdminSmart Client UI 插件通过公开 Slot 替换。
+# 官方品牌与侧栏父组件保留原始界面；侧栏与Hero仅通过公开品牌Slot显示AuraSearch，不覆盖Workspace或空会话布局。
 - id: ui-brand-official
+  disabled: false
+
+# 业务身份与模型由AdminSmart登录和API供应商负责；官方账号/充值引导含大型内嵌图片，按用户选择停用此UI。
+# 只使用官方disabled契约，不移除account-controller、既有账号凭据或模型；管理员设置沿官方独立Settings入口。
+- id: ui-settings-account
   disabled: true
 
 - id: ui-cordis
@@ -367,6 +399,9 @@
     - id: adminsmart-runtime-host
       name: '__ADMINSMART_HARNESS_HOST_PLUGIN_URI__'
     # 原生模块仅作为只读 Client 资源由提供方调用；唯一 owned entry 避免重复 ConfigForms。
+    # 固定版没有独立Client贡献API，公开wrapper预登记并同fiber调用原Workspace/Session Client，原Host仍停用。
+    - id: adminsmart-official-remotes
+      name: '__ADMINSMART_OFFICIAL_REMOTES_PLUGIN_URI__'
     - id: adminsmart-shared-settings
       name: '__ADMINSMART_SHARED_SETTINGS_PLUGIN_URI__'
     # 仅通过官方快捷键公开配置接口采用后端策略，不接管键盘引擎或固定输入动作。
@@ -378,6 +413,12 @@
       config:
         timeZone: Asia/Shanghai
         refreshIntervalMs: 0
+
+# 个人明暗使用官方字段及持久化属主，只有新账号的继承默认值为浅色。
+- id: ui-theme
+  config:
+    # 仅作为新账号的官方继承值；已保存个人偏好由官方用户 Profile 覆盖保留。
+    preference: light
 
 # 用户知识问答永久关闭 Harness 遥测上传。
 - id: session-telemetry-otel

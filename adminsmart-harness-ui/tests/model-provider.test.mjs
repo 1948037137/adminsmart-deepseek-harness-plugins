@@ -1,7 +1,7 @@
 /** 官方模型发布只从 Host Profile/Credentials 读取，浏览器只选择提供方 ID。 */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildManagedProvider, installManagedProviderSync, listOfficialProviderModels, publishManagedProvider, runManagedProviderMutation, updateOfficialModelReasoning } from '../src/model-provider.mjs'
+import { buildManagedProvider, installManagedProviderSync, publishManagedProvider, runManagedProviderMutation } from '../src/model-provider.mjs'
 
 const profile = {
   displayName: 'Fixture GPT', // 后端唯一供应商展示名。
@@ -44,6 +44,76 @@ test('reserved Runtime credentials cannot be published as a model provider key',
   await assert.rejects(buildManagedProvider(invalid, 'gpt'), /凭据引用无效/u)
 })
 
+test('tagged native options preserve raw reasoning states and never infer defaults or edit official settings', async () => {
+  const officialProfile = { ...profile, reasoning: 'max', models: [
+    { id: 'inherited-model', name: 'Inherited Model', contextWindow: 128000 }, // 缺省元数据必须与显式禁用不同。
+    { id: 'disabled-model', name: 'Disabled Model', contextWindow: 128000, reasoningEfforts: false }, // 原生明确无思考能力。
+    { id: 'declared-model', name: 'Declared Model', contextWindow: 128000, reasoning: 'fixture-legacy-value', reasoningEfforts: { off: null, max: 'ultra' } }, // 保留官方线值；旧模型reasoning字段不是官方Schema能力，不得发布。
+  ] } // 同一提供方各模型三态保持独立，不套用整组共同能力。
+  const before = structuredClone(officialProfile) // 原生配置快照用于确认发布没有回写或隐式修改。
+  const host = { ...ctx,
+    configEditor: {
+      entries: () => [{ options: { id: 'llm-pi-ai', config: { providers: { gpt: officialProfile } } } }], // 发布仅从实际官方原始配置构造元数据。
+      edit: async () => { assert.fail('共享发布不得修改官方设置') }, // 不允许业务插件重写原生等级。
+    },
+    settings: { describe: () => [{ ns: 'llm-pi-ai', value: { providers: { gpt: { reasoning: 'high' } } } }] }, // 生效默认不能补入原始配置缺失字段。
+    llm: { resolveModelInfo: async () => ({
+      context: { contextWindow: 128000 }, // 模型解析仅提供容量兜底。
+      inputModalities: ['text'], // 保留已有公开输入能力兜底。
+      reasoning: { efforts: [{ id: 'low', name: 'Low' }], defaultEffort: 'low' }, // UI级解析不提供真实线值，不能重造映射或默认。
+    }) },
+  } // 全部使用内存Fixture，无真实凭据或模型网络请求。
+  const built = await buildManagedProvider(host, 'gpt') // 直接验证实际共享请求构造函数。
+  assert.deepEqual(built.nativeProviderOptions, { reasoning: 'max' })
+  assert.deepEqual(built.models.map(model => model.nativeModelOptions), [
+    {}, { reasoningEfforts: false }, { reasoningEfforts: { off: null, max: 'ultra' } },
+  ])
+  assert.equal(built.models.some(model => Object.hasOwn(model, 'defaultReasoningEffort') || Object.hasOwn(model, 'modelId')), false)
+  assert.deepEqual(officialProfile, before)
+  built.models[2].nativeModelOptions.reasoningEfforts.max = 'fixture-local-change'
+  built.models[2].reasoningEfforts.max = 'fixture-compat-change'
+  assert.deepEqual(officialProfile, before) // 请求对象与原始官方映射分离，调用方不能污染真源。
+  delete officialProfile.reasoning
+  const withoutDefault = await buildManagedProvider(host, 'gpt') // 不从生效Profile的high或模型解析的low补缺失默认。
+  assert.deepEqual(withoutDefault.nativeProviderOptions, {})
+  assert.deepEqual(withoutDefault.models[0].nativeModelOptions, {})
+})
+
+test('signed publication serializes native false and omission distinctly and rejects malformed metadata before writing', async () => {
+  const officialProfile = { ...profile, reasoning: 'off', models: [
+    { id: 'inherited-model', name: 'Inherited Model', contextWindow: 128000 }, // 序列化后仍不生成reasoningEfforts字段。
+    { id: 'disabled-model', name: 'Disabled Model', contextWindow: 128000, reasoningEfforts: false }, // 序列化后明确保留false。
+  ] } // 合成原生配置，无磁盘或用户数据访问。
+  const host = { ...ctx, configEditor: {
+    entries: () => [{ options: { id: 'llm-pi-ai', config: { providers: { gpt: officialProfile } } } }], // 唯一可信模型配置源。
+  } } // 发布函数使用Fake签名回环网络。
+  const previousFetch = globalThis.fetch // 测试结束恢复网络入口。
+  let requests = 0 // 形状无效时不允许向后台提交。
+  try {
+    globalThis.fetch = async (_url, options) => {
+      requests += 1
+      const body = JSON.parse(options.body) // 实际Host请求序列化结果，只包含合成数据。
+      assert.deepEqual(body.nativeProviderOptions, { reasoning: 'off' })
+      assert.deepEqual(body.models[0].nativeModelOptions, {})
+      assert.deepEqual(body.models[1].nativeModelOptions, { reasoningEfforts: false })
+      return { ok: true, json: async () => ({ providers: [] }) }
+    }
+    const options = {
+      apiBase: 'http://127.0.0.1:9098', // 合成内部API根地址。
+      token: 'fixture-capability', // 合成签名能力，不访问真实令牌。
+      userId: '7', // Fake可信actor。
+      modeId: 'knowledge', // 固定知识模式Fixture。
+      presetId: 'adminsmart-knowledge', // 合成受管Preset。
+    } // 当前测试的签名上下文，不改变认证契约。
+    await publishManagedProvider(host, 'gpt', options)
+    for (const malformed of [null, true, [], 'low']) { // 不能把错误形状静默转成继承或禁用。
+      officialProfile.models[1].reasoningEfforts = malformed
+      await assert.rejects(publishManagedProvider(host, 'gpt', options), /官方模型思考元数据无效/u)
+    }
+    assert.equal(requests, 1)
+  } finally { globalThis.fetch = previousFetch }
+})
+
 test('a native inherited output cap remains unknown in the managed catalog', async () => {
   const inherited = { ...ctx,
     configEditor: { entries: () => [{ options: { id: 'llm-pi-ai', config: { providers: { gpt: { ...profile, models: [{ id: 'fixture-model', name: 'Fixture Model' }] } } } } }] },
@@ -62,46 +132,6 @@ test('a native inherited output cap remains unknown in the managed catalog', asy
     await publishManagedProvider(inherited, 'gpt', { apiBase: 'http://127.0.0.1:9098', token: 'fixture-capability', userId: '7', modeId: 'knowledge', presetId: 'adminsmart-knowledge' })
     assert.equal(publishedOutputCap, null)
   } finally { globalThis.fetch = previousFetch }
-})
-
-test('reasoning saved for one backend model mirrors only the corresponding official model', async () => {
-  let updated // 官方 ConfigEditor 写入的完整非敏感候选配置。
-  const privateCtx = {
-    configEditor: {
-      entries: () => [{ options: { id: 'llm-pi-ai' } }], // 与当前管理员可编辑条目一一对应。
-      edit: async (_entry, change) => { updated = change({ providers: { gpt: { ...profile } } }) }, // 无磁盘写入的官方编辑器替身。
-    },
-  }
-  await updateOfficialModelReasoning(privateCtx, 'gpt', 'fixture-model', { off: null, max: 'ultra' })
-  assert.deepEqual(updated.providers.gpt.models[0].reasoningEfforts, { off: null, max: 'ultra' })
-  assert.equal(profile.models[0].reasoningEfforts.off, undefined) // 原输入不得被隐式修改。
-  await assert.rejects(updateOfficialModelReasoning(privateCtx, 'gpt', 'other-model', { high: 'high' }), /官方模型已变化/u)
-})
-
-test('unpublished official models expose their reasoning but never the provider credential', () => {
-  const models = listOfficialProviderModels(ctx, 'gpt') // 不调用业务发布接口，直接列出私有 Profile 的已保存模型。
-  assert.deepEqual(models, [{ id: 'fixture-model', name: 'Fixture Model', reasoningEfforts: { max: 'ultra' } }])
-  assert.doesNotMatch(JSON.stringify(models), /GPT_FIXTURE_KEY|fixture-secret|models\.example\.test/u)
-  assert.throws(() => listOfficialProviderModels(ctx, 'missing'), /请先保存模型供应商/u)
-})
-
-test('private reasoning validates each wire value and disables inherited capabilities when empty', async () => {
-  let saved = { providers: { gpt: { ...profile, models: [...profile.models] } } } // 模拟官方编辑器在每次热重载后保留最新配置。
-  const privateCtx = {
-    configEditor: {
-      entries: () => [{ options: { id: 'llm-pi-ai', config: saved } }], // 当前管理员的隔离 Profile，不是受管业务目录。
-      edit: async (_entry, change) => { saved = change(saved) }, // 在内存中执行公开 ConfigEditor 的修改回调。
-    },
-  }
-  await assert.rejects(updateOfficialModelReasoning(privateCtx, 'gpt', 'fixture-model', { ultra: 'ultra' }), /不受支持/u)
-  await assert.rejects(updateOfficialModelReasoning(privateCtx, 'gpt', 'fixture-model', { high: '' }), /线协议值无效/u)
-  await assert.rejects(updateOfficialModelReasoning(privateCtx, 'gpt', 'fixture-model', { high: null }), /线协议值无效/u)
-  assert.deepEqual(listOfficialProviderModels(privateCtx, 'gpt')[0].reasoningEfforts, { max: 'ultra' })
-  await updateOfficialModelReasoning(privateCtx, 'gpt', 'fixture-model', {})
-  assert.equal(saved.providers.gpt.models[0].reasoningEfforts, false)
-  assert.deepEqual(listOfficialProviderModels(privateCtx, 'gpt')[0].reasoningEfforts, {})
-  await updateOfficialModelReasoning(privateCtx, 'gpt', 'fixture-model', { off: null, high: 'high' })
-  assert.deepEqual(saved.providers.gpt.models[0].reasoningEfforts, { off: null, high: 'high' })
 })
 
 test('official settings and credential commits automatically synchronize the administrator provider', async () => {
@@ -185,4 +215,53 @@ test('provider mutations serialize per Runtime and recover after a failed task',
   await assert.rejects(first, /fixture-failure/u)
   assert.equal(await second, 'confirmed')
   assert.deepEqual(steps, ['first-start', 'first-end', 'second'])
+})
+
+test('共享删除与原生操作串行，后台引用竞态拒绝不删Key，super失败只补偿当前真实Profile', async () => {
+  const previousFetch = globalThis.fetch // 全部网络动作由本测试的签名回环Fake接管。
+  const callbacks = new Map() // 当前Host公开设置/凭据通知，不伪造Key恢复。
+  const disposers = [] // 任务结束前停止本测试去抖及订阅。
+  const requests = [] // 发布/撤销的顺序证据，不记录任何真实凭据。
+  let refuseDelete = false // 资格检查后另一客户端改变默认用途时，后台锁内DELETE必须拒绝。
+  let nativeDeletes = 0 // 后台拒绝前不允许真实Key或Profile动作。
+  let saved = { gpt: structuredClone(profile) } // 当前官方Profile是失败补偿的唯一真源。
+  const host = {
+    ...ctx,
+    configEditor: { entries: () => [{ options: { id: 'llm-pi-ai', config: { providers: saved } } }] },
+    credentials: { ...ctx.credentials, describe: async () => ({ configured: false }) }, // Keyunset期间不允许事件自动重新发布。
+    logger: { warn() {} },
+    on(name, callback) { callbacks.set(name, callback); return () => callbacks.delete(name) },
+    effect(register) { disposers.push(register()) },
+  }
+  try {
+    globalThis.fetch = async (_url, options) => {
+      requests.push(options.method)
+      if (options.method === 'DELETE' && refuseDelete) return { ok: false, status: 400, json: async () => ({ error: { code: 'chat_provider_in_use' } }) }
+      return { ok: true, status: 200, json: async () => ({ providers: [] }) }
+    }
+    const synchronization = installManagedProviderSync(host, { apiBase: 'http://127.0.0.1:9098', readToken: async () => 'fixture-capability', userId: '7', modeId: 'knowledge', presetId: 'adminsmart-knowledge' }) // 当前成功POST确认的route才可删除。
+    await new Promise(resolve => setTimeout(resolve, 350))
+    assert.deepEqual(requests, ['POST'])
+    refuseDelete = true
+    await assert.rejects(synchronization.withDeletion(['gpt'], async () => { nativeDeletes += 1 }), /未获后台确认/u)
+    assert.equal(nativeDeletes, 0)
+    assert.deepEqual(requests, ['POST', 'DELETE'])
+    refuseDelete = false
+    await assert.rejects(synchronization.withDeletion(['gpt'], async () => { throw new Error('synthetic-native-CAS-failure') }), /synthetic-native-CAS-failure/u)
+    assert.deepEqual(requests.slice(-2), ['DELETE', 'POST']) // 只重新发布仍存在的真实Profile，不重试Key删除或伪恢复Key。
+    await synchronization.withDeletion(['gpt'], async () => { nativeDeletes += 1 }) // 模拟官方先删Key，Profile仍在等待随后mutate。
+    const afterUnset = requests.length // 凭据提交事件不能在native Profile删除前重新建共享目录。
+    callbacks.get('credentials/reference-updated')('GPT_FIXTURE_KEY')
+    await new Promise(resolve => setTimeout(resolve, 350))
+    assert.equal(requests.length, afterUnset)
+    await synchronization.withDeletion(['gpt'], async () => { saved = {}; nativeDeletes += 1 }) // 后续配置删除无二次DELETE，仍使用原生动作。
+    assert.equal(requests.length, afterUnset)
+    assert.equal(nativeDeletes, 2)
+    const unknownBaseline = requests.length // 未由本Host确认的其它共享route不能被冷启动推测撤销。
+    await synchronization.withDeletion(['other-admin-route'], async () => {})
+    assert.equal(requests.length, unknownBaseline)
+  } finally {
+    for (const dispose of disposers) dispose?.()
+    globalThis.fetch = previousFetch
+  }
 })

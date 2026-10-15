@@ -1,0 +1,28 @@
+{
+  "name": "@adminsmart/dsh-official-remotes",
+  "description": "仅装配固定官方 Workspace 与 Session Client，Host 由受管公开继承提供。",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-modules",
+        "@deepseek-ai/dsh-api-gateway",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-file-upload"
+      ],
+      "external": ["@deepseek-ai/dsh-api-gateway/client"]
+    }
+  },
+  "scripts": {
+    "check": "node --check index.mjs && node --check client.js"
+  }
+}
